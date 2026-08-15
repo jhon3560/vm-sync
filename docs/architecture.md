@@ -55,11 +55,15 @@ VictoriaMetrics 的 `/api/v1/export`（查询）与 `/api/v1/import`（写入）
 
 ## 5. 实时性模型（与 influx-sync 的关键差异）
 
-VictoriaMetrics **没有** SUBSCRIPTION 推送机制，因此无快路径：
+VictoriaMetrics 单机版**没有** SUBSCRIPTION 式"写后推送"，V0.1 无快路径：
 
 - 实时性靠低水位轮询：`interval: 500ms` + `watermark: 1s`（默认）→ e2e ≈ 1.5~2.5s；
 - VM 写入即查询可见（无 Influx 的可见性顾虑），watermark 仅防时钟抖动，可配到更低；
 - export 查询走索引、无聚合开销，500ms 轮询成本可忽略。
+
+**快路径（V2 计划）**：VM 生态的标准"订阅"替代是 **vmagent 多目标 remoteWrite 双写**
+（写入方 → vmagent → [源 VM, vm-sync 快路径端点]），sender 实现 remote_write 接收端
+（snappy protobuf 解码 → JSON lines → 帧），复用 influx-sync 去重集，e2e 可达 0~1s。
 
 ## 6. 关键设计约束
 

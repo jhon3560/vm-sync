@@ -24,7 +24,7 @@ VictoriaMetrics，单向、有序、At-Least-Once、断点续传同步。
 | 源/目标 | InfluxDB 1.x | VictoriaMetrics |
 | 查询 | `SELECT *` + schema 发现 | `/api/v1/export`（无 schema 概念） |
 | 写库 | Line Protocol | `/api/v1/import`（与 export 对称，零转换） |
-| 实时快路径 | SUBSCRIPTION 推送透传（0~1s） | **无**（VM 无推送机制），靠低水位轮询（watermark 1s，e2e ≈1.5~2.5s） |
+| 实时快路径 | SUBSCRIPTION 推送透传（0~1s） | V0.1 无（VM 本体无推送机制）；V2 计划经 vmagent 双写 remoteWrite 实现（见 docs/plan.md §2.3） |
 | 时间精度 | 纳秒 | 毫秒（VM 存储精度） |
 | 可靠性骨架 | 同款（ISFP/WAL/去重/DLQ/反压/打包体系） | 同款 |
 
