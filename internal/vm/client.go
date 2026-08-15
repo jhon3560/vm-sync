@@ -57,6 +57,9 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 		d = parsed
 	}
+	if len(cfg.Match) == 0 {
+		cfg.Match = []string{`{__name__=~".+"}`} // export 端点必须带 match[]；匹配所有具名序列
+	}
 	return &Client{
 		cfg: cfg,
 		http: &http.Client{

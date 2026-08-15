@@ -169,8 +169,8 @@ func (m *Metrics) BackpressureStatus() int64 { return m.bpStatus.Load() }
 
 // Render 输出 Prometheus 文本格式。
 func (m *Metrics) Render() []byte {
-	now := nowUnixNano()
-	syncDelay := (now - m.cursor.Load()) / 1e9
+	now := nowUnixMilli()
+	syncDelay := (now - m.cursor.Load()) / 1000
 	if syncDelay < 0 {
 		syncDelay = 0
 	}
@@ -289,8 +289,8 @@ vm_sync_poison_packet_count %d
 	return []byte(out)
 }
 
-// nowUnixNano 可被测试替换。
-var nowUnixNano = func() int64 { return time.Now().UnixNano() }
+// nowUnixMilli 可被测试替换（vm-sync 游标/时间戳统一毫秒，VM 存储精度）。
+var nowUnixMilli = func() int64 { return time.Now().UnixMilli() }
 
 // e2eDelay 端到端延迟秒数（now - 最后落库点时间）。0=未知（尚无写入）。
 func (m *Metrics) e2eDelay() int64 {
@@ -298,7 +298,7 @@ func (m *Metrics) e2eDelay() int64 {
 	if ts == 0 {
 		return 0
 	}
-	d := (nowUnixNano() - ts) / 1e9
+	d := (nowUnixMilli() - ts) / 1000
 	if d < 0 {
 		d = 0
 	}
