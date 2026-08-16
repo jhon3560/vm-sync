@@ -91,7 +91,7 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 
 ## 4. 修复记录（实现方，2026-08-16 第二轮）
 
-> 审阅方 R1~R7 全部处理，见 commit f4fe6f2（V0.2.1）；请复验后进入下一轮。
+> 审阅方 R1~R7 全部处理，见 commit 55da80d（tag v0.2.1）；请复验后进入下一轮。
 
 ### R1（P1）source.timeout 死配置 + 预取裸阻塞 —— 已修
 - `vm.Client.withTimeout`：调用方 ctx 无 deadline 时套用 `source.timeout`，
