@@ -146,3 +146,50 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 ### 复验入口
 - 全量 `go test ./...`、`go vet ./...`、`go test -race ./internal/...` 通过；
 - fork 同步移植同批修复（待提交，见 fork FORK.md）。
+
+## 5. 第二轮复验（审阅方，2026-08-16 19:59）
+
+> 复验对象：55da80d（V0.2.1，R1~R7 响应）+ b6a05da（V0.2.2，R8 自查修复）。
+> 结论先行：**R1~R8 全部修复属实、测试可复现；全量 build/vet/test/race 复跑全绿；**
+> configuration.md 示例已可原样加载。**但发现新问题 R9（fork 移植编译失败，P1）**
+> 与 R10/R11 两个小瑕疵，见下。
+
+### 逐项复验
+
+| # | 复验结果 | 取证 |
+|---|---|---|
+| R1 | ✅ 通过 | withTimeout 三处挂载（export/probe/import）；消费轮 select{slot/ctx.Done}；receiver 实测传动态 deadline ctx（10s+每KB 1ms，封顶 120s）→"尊重调用方 deadline"语义无回归；3 个新测试通过；race 全绿 |
+| R2 | ✅ 通过 | 欠满判定改 `len(raw)<WindowTarget`（字节）；TestPollerUnderfillByBytes（2 行 12KB 判稠密、窗口不翻倍）通过；window_target 语义/默认值（frame_bytes×4=2MB）文档一致 |
+| R3 | ✅ 通过 | README/architecture/plan 已改"欠满窗口翻倍"；operations.md 补 prefetch 日志与失败复位说明 |
+| R4 | ✅ 通过 | audit-v020 更正为 7 个测试函数 |
+| R5 | ✅ 通过 | 报错带窗口跨度（`exceeds %dMB for %.1fs window`）+ 拆分 match 建议 |
+| R6 | ✅ 通过 | launchPrefetch 补 `underfillStreak==0 && nw>MaxWindow` 守卫；architecture.md §2.1 内存边界（~1GB）落地 |
+| R7 | ✅ 通过 | WatermarkDuration 默认 10s→1s |
+| R8 | ✅ 通过 | ByteSize.UnmarshalYAML + parseByteSize（大小写/空白容忍，GB/MB/KB/B）；审阅方加做最强验证：**configuration.md 示例原样 LoadSender 成功**（frame_bytes=524288、window_target=2097152，临时取证测试用完已删） |
+| 全量测试 | ✅ | 审阅方实测 `go build/vet/test/test -race` 全绿；fork 19462c5（V0.2.1 移植）测试通过 |
+| hash 笔误 | ✅ 已自行修正 | 6322776 |
+
+### 新发现
+
+**R9（P1，fork 交付物）V0.2.2 fork 移植编译失败**
+- vm-sync-fork f3df219 移植了 ByteSize 类型，但 `app/vm-sync/vmsync.go:136`
+  `cfg.Sync.FrameBytes = *flagFrameBytes` 仍是 `flag.Int`（int）→
+  config.ByteSize 赋值不匹配，**fork 根包编译失败**：
+  `cannot use *flagFrameBytes (variable of type int) as config.ByteSize value in assignment`；
+  `go test ./app/vm-sync/...` 根包 build failed（审阅方实测）。
+- 另：fork 未暴露 window_target 开关（无 flagWindowTarget，依赖 NewPoller 默认值
+  =frame_bytes×4，行为正确，但 FORK.md 开关清单应注明）。
+- 建议：`cfg.Sync.FrameBytes = config.ByteSize(*flagFrameBytes)`；移植后必须跑
+  `go test ./app/vm-sync/...` 全包（本次明显未跑）。
+
+**R10（P4，nit）** poller_test.go:185 注释残留行数语义（"每窗 < 100 目标"），
+字节阈值已改 10000，注释未同步。
+
+**R11（P4，nit）** 修复记录称 fork "待提交"，实际 V0.2.1/V0.2.2 已提交
+（19462c5/f3df219）——文档口径滞后；且 V0.2.2 移植恰有 R9 编译问题，
+建议提交前先跑通 fork 全量测试再更新文档口径。
+
+### 正面评价（流程）
+
+实现方本轮自查发现 R8 并诚实标注"R6 声称'内存峰值已记入架构说明'此前未落地，
+本轮补上"——自审计意识良好，请保持。R9 修复后本轮可闭环，进入下一阶段。
