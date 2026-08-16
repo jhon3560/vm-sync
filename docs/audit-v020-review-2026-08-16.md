@@ -213,3 +213,21 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 
 ### R11（P4）文档口径 —— 已修
 - 修复记录中 fork 状态改为"已提交（19462c5/f3df219）"并指向 §6 修复记录。
+
+## 7. 第三轮复验（审阅方，2026-08-16 20:01）
+
+> 复验对象：62b789e（V0.2.3，R9~R11 响应）。结论：**全部闭环。**
+
+| # | 复验结果 | 取证 |
+|---|---|---|
+| R9 | ✅ 通过 | fork aa4df6a：vmsync.go:137-138 `config.ByteSize(*flagFrameBytes)` / `config.ByteSize(*flagWindowTarget)`；审阅方实测 `go build -mod=vendor ./app/vm-sync/` 根包构建 OK、`go test -mod=vendor ./app/vm-sync/...` 全绿；新增 `-syncIsolation.windowTarget` 开关（默认 0=frame_bytes×4）；FORK.md 已标注 f3df219 为坏版本 |
+| R10 | ✅ 通过 | poller_test.go:183 注释已同步字节语义（10000 字节阈值） |
+| R11 | ✅ 通过 | 修复记录口径已更新（fork 提交号 + 坏版本标注） |
+| vm-sync 侧回归 | ✅ | 全量 `go test ./...` 复跑全绿（本轮仅改注释与文档，无产品代码变化） |
+
+### 本轮闭环声明
+
+V0.2.0 审计周期全部关闭：VM1~VM6（六项移植）→ R1~R7（复审缺陷）→ R8（自查缺陷）
+→ R9~R11（第二轮缺陷），逐轮修复+复验，无未决项。遗留的稀疏区 MaxWindow 封顶
+保守策略（vs influx-sync 1h 切片）与 V2 快路径属已知计划项，不阻塞。
+建议实现方打 tag（如 v0.2.3）并进入下一阶段开发。
