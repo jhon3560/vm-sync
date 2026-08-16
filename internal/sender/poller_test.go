@@ -182,7 +182,7 @@ func TestPollerSparseWindowGrowth(t *testing.T) {
 		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
 		FrameLines: 10, WindowTarget: 10000, // 字节阈值：~70B/行稀疏数据恒欠满 → 翻倍到 MaxWindow
 	})
-	// 稀疏 0.1 行/s：每窗 < 100 目标 → 翻倍至 MaxWindow(30s) 封顶。
+	// 稀疏 0.1 行/s（~7B/行）：每窗字节数 < 10000 目标 → 翻倍至 MaxWindow(30s) 封顶。
 	// 12 轮后游标应远超 12×5s=60s（修复前约 60s）。
 	for i := 0; i < 12; i++ {
 		p.pollOnce(context.Background())

@@ -145,7 +145,8 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 
 ### 复验入口
 - 全量 `go test ./...`、`go vet ./...`、`go test -race ./internal/...` 通过；
-- fork 同步移植同批修复（待提交，见 fork FORK.md）。
+- fork 同步移植同批修复（已提交：V0.2.1=19462c5、V0.2.2=f3df219——后者经第二轮复审
+  发现 R9 编译失败，见 §5 修复记录）。
 
 ## 5. 第二轮复验（审阅方，2026-08-16 19:59）
 
@@ -193,3 +194,22 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 
 实现方本轮自查发现 R8 并诚实标注"R6 声称'内存峰值已记入架构说明'此前未落地，
 本轮补上"——自审计意识良好，请保持。R9 修复后本轮可闭环，进入下一阶段。
+
+## 6. 第二轮修复记录（实现方，2026-08-16）
+
+> 审阅方 R9/R10/R11 全部处理；请复验后进入下一轮。
+
+### R9（P1）fork 编译失败 —— 已修
+- `app/vm-sync/vmsync.go:136` 补 `config.ByteSize(*flagFrameBytes)` 转换；
+- 顺带新增 `-syncIsolation.windowTarget` 开关（0=frame_bytes×4，R2 字节语义）；
+- **修复验证**：`go build -mod=vendor ./app/vm-sync/` + `go test -mod=vendor
+  ./app/vm-sync/...` 全绿。教训：无测试文件的根包 `go test` 输出 `?` 易漏
+  编译错误，fork 移植后必须显式 `go build` 根包；
+- fork 提交 <hash>（tag feature-isolation-sync-v0.2.3；v0.2.2=f3df219 为坏版本，
+  勿使用）。
+
+### R10（P4）注释残留 —— 已修
+- poller_test.go 稀疏测试注释同步字节语义（10000 字节阈值）。
+
+### R11（P4）文档口径 —— 已修
+- 修复记录中 fork 状态改为"已提交（19462c5/f3df219）"并指向 §6 修复记录。
