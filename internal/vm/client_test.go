@@ -183,3 +183,43 @@ func TestExportRespTooLarge(t *testing.T) {
 		t.Fatalf("expected truncation error with guidance, got %v", err)
 	}
 }
+
+// TestExportRangeTimeoutEffective R1 回归：source.timeout 必须真正生效——
+// 调用方 ctx 无 deadline 时按配置值截断（此前死配置：挂起源最长拖 15 分钟兜底）。
+func TestExportRangeTimeoutEffective(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Second) // 挂起源
+	}))
+	defer srv.Close()
+	c, err := NewClient(Config{URL: srv.URL, Timeout: "200ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := c.ExportRange(context.Background(), 0, 1000); err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if el := time.Since(start); el > 900*time.Millisecond {
+		t.Fatalf("timeout not effective: blocked %v", el)
+	}
+}
+
+// TestImportWriteRespectsCallerDeadline R1 配套：调用方已带 deadline（receiver
+// 按批大小动态超时）时不得被 source.timeout 截断——大 batch 需要 >10s 时
+// 配置值 10s 不得抢先生效。
+func TestImportWriteRespectsCallerDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c, err := NewClient(Config{URL: srv.URL, Timeout: "100ms"}) // 配置超时短于实际耗时
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.ImportWrite(ctx, []byte(`{"metric":{"__name__":"m"},"values":[1],"timestamps":[0]}`)); err != nil {
+		t.Fatalf("caller deadline must be respected, got %v", err)
+	}
+}

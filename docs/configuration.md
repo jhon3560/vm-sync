@@ -17,7 +17,8 @@ sync:
   max_window: 30s    # 单轮窗口上限（防时间跳变/积压）
   frame_lines: 5000  # 每帧最多 export 行数（每行可含多样本）
   frame_bytes: 512KB # 每帧压缩前字节上限（超限自动分块，单行不拆分）
-  window_target: 20000  # V0.2/N14 窗口增长目标行数（默认=frame_lines×4）：欠满判定阈值，
+  window_target: 2MB    # V0.2 窗口增长目标字节数（默认=frame_bytes×4）：欠满判定阈值，
+                        # 按 export 响应字节数判定（行数在高样本率少序列库会误判稀疏→窗口震荡），
                         # 与帧大小解耦——稀疏库窗口仍按大数据量目标增长，不被帧行数锁死
   backfill: all      # 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d 单位，1d=24h）
 

@@ -180,7 +180,7 @@ func TestPollerSparseWindowGrowth(t *testing.T) {
 	m := monitor.New()
 	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
 		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
-		FrameLines: 10, WindowTarget: 100,
+		FrameLines: 10, WindowTarget: 10000, // 字节阈值：~70B/行稀疏数据恒欠满 → 翻倍到 MaxWindow
 	})
 	// 稀疏 0.1 行/s：每窗 < 100 目标 → 翻倍至 MaxWindow(30s) 封顶。
 	// 12 轮后游标应远超 12×5s=60s（修复前约 60s）。
@@ -361,5 +361,92 @@ func TestPollerExportErrorResetsStreak(t *testing.T) {
 	p.pollOnce(context.Background())
 	if w.Cursor() != int64(5*time.Second/time.Millisecond) {
 		t.Fatalf("cursor=%d want %d (self-heal with base window)", w.Cursor(), int64(5*time.Second/time.Millisecond))
+	}
+}
+
+// TestPollerUnderfillByBytes R2 回归：欠满判定按响应**字节数**——少行数但大体积
+// （单行多样本）的窗口必须判稠密（不复位则窗口翻倍到上限 → 周期触碰 N15 震荡）。
+func TestPollerUnderfillByBytes(t *testing.T) {
+	var big string
+	{
+		var b strings.Builder
+		b.WriteString(`{"metric":{"__name__":"big"},"values":[`)
+		for i := 0; i < 5000; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("1")
+		}
+		b.WriteString(`],"timestamps":[0,100,200]}` + "\n")
+		big = b.String()
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		// 每窗固定 2 行 ≈ 12KB：行数极少（< FrameLines），但字节数大
+		fmt.Fprint(w, big+big)
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
+		FrameLines: 5000, WindowTarget: 5000, // 12KB/窗 ≥ 5KB → 稠密，窗口不翻倍
+	})
+	p.pollOnce(context.Background())
+	if p.underfillStreak != 0 {
+		t.Fatalf("dense-by-bytes window must reset streak, got %d", p.underfillStreak)
+	}
+	p.pollOnce(context.Background())
+	if w.Cursor() != int64(10*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d want %d (no window growth for byte-dense data)", w.Cursor(), int64(10*time.Second/time.Millisecond))
+	}
+}
+
+// TestPollerPrefetchCtxCancel R1 配套：消费轮等待预取结果必须可被 ctx 取消打断
+// （源 VM 挂起时预取查询可能 10s 级延迟，关停不得阻塞在其上）。
+func TestPollerPrefetchCtxCancel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 5 * time.Second,
+		FrameLines: 1000, WindowTarget: 1000,
+	})
+	// 注入永不就绪的预取槽
+	p.prefetch = &prefetchSlot{cursor: 0, end: 5000, ch: make(chan prefetchResult)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	p.pollOnce(ctx)
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Fatalf("pollOnce must not block on prefetch after ctx cancel, blocked %v", el)
 	}
 }

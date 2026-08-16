@@ -46,7 +46,7 @@ ISFP 协议（帧/CRC/seq、gzip+zstd）、TCP 停等/滑窗 + 流水线按序 A
 
 `backfill: all`（默认全量）/ `0`（仅实时）/ `30d`（有界，d 单位）；改配置+重启即生效
 （免清数据目录）；配置变化才一次性回拨游标；存量升级只记录不回拨；export 二分探测
-最早数据（谓词"[0,X) 有无数据"）+ 空窗翻倍跳过兜底。
+最早数据（谓词"[0,X) 有无数据"）+ 欠满窗口翻倍跳过兜底（V0.2）。
 
 ## 3. 模块划分（module vm-sync）
 
@@ -57,7 +57,7 @@ internal/protocol ISFP 帧编解码（gzip/zstd）
 internal/transport TCP 停等客户端 / 流水线服务端
 internal/wal      分段 WAL + backfill 回拨策略
 internal/vm       VictoriaMetrics 客户端：ExportRange / ImportWrite / ProbeOldestData
-internal/sender   Poller（export 窗口 + 空窗跳过 + 分块）+ Sender（停等/滑窗）
+internal/sender   Poller（export 窗口 + 欠满窗口翻倍跳过 + 分块）+ Sender（停等/滑窗）
 internal/receiver 帧处理（去重/DLQ/import 写库）
 internal/monitor  Prometheus 指标（vm_sync_* 前缀）
 internal/config   配置加载（d 时长单位、backfill all/0/Nd）

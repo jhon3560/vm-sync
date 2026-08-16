@@ -52,8 +52,9 @@ type SenderConfig struct {
 		MaxWindow  string `yaml:"max_window"`  // 单轮窗口上限（防时间跳变，默认 30s）
 		FrameLines int    `yaml:"frame_lines"` // 每帧最多 export 行数（每行可含多样本），默认 5000
 		FrameBytes int    `yaml:"frame_bytes"` // 每帧压缩前字节上限，默认 512KB
-		// WindowTarget 窗口增长目标行数（V0.2/N14，默认=frame_lines×4）：欠满判定阈值，
-		// 与帧大小解耦——稀疏库窗口仍按大数据量目标增长，不被帧行数锁死。
+		// WindowTarget 窗口增长目标字节数（V0.2/N14+R2，默认=frame_bytes×4）：欠满判定
+		// 阈值，按 export 响应字节数判定——行数在高样本率少序列库会误判稀疏导致
+		// 窗口震荡，字节数与帧大小解耦且直接对应导出开销（N15 内存上限同源）。
 		WindowTarget int    `yaml:"window_target"`
 		Backfill     string `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
 	} `yaml:"sync"`
@@ -341,8 +342,10 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 }
 
 // WatermarkDuration 返回水位延迟。
+// R7：默认 1s——与 PollerConfig 的 watermark 默认一致（曾为 10s，backfill=0
+// 首次游标多爬 9s，与"水位 1s"语义冲突；多爬不丢数据仅语义不符）。
 func (c *SenderConfig) WatermarkDuration() time.Duration {
-	return dur(c.Sync.Watermark, 10*time.Second)
+	return dur(c.Sync.Watermark, time.Second)
 }
 
 // FastPathConfig 转换（A4 快路径）。

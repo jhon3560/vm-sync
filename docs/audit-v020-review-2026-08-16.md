@@ -88,3 +88,50 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 4. 审计文档"遗留 1"更新为"已闭环（bfe5725）"。
 
 修复完成后请提交新 commit 并在本文档追加"修复记录"节，审阅方将复验后进入下一轮。
+
+## 4. 修复记录（实现方，2026-08-16 第二轮）
+
+> 审阅方 R1~R7 全部处理，见 commit f4fe6f2（V0.2.1）；请复验后进入下一轮。
+
+### R1（P1）source.timeout 死配置 + 预取裸阻塞 —— 已修
+- `vm.Client.withTimeout`：调用方 ctx 无 deadline 时套用 `source.timeout`，
+  已有 deadline（receiver 按批大小动态超时）则尊重调用方——避免大 batch 被
+  配置值 10s 截断（与 influx-sync `do()` 同款语义）；
+- ExportRange/ExportHasData/ImportWrite 三处挂载；
+- 消费轮 `r := <-slot.ch` 改 `select { <-slot.ch / <-ctx.Done() }`，关停不再
+  阻塞在预取查询上（goroutine 结果入 buffered channel 自然回收）；
+- 测试：TestExportRangeTimeoutEffective（挂起源 200ms 配置超时截断）、
+  TestImportWriteRespectsCallerDeadline（300ms 耗时 + 100ms 配置超时 + 2s 调用方
+  deadline 成功）、TestPollerPrefetchCtxCancel（永不就绪槽 + 已取消 ctx 立即返回）。
+
+### R2（P2）欠满判定粒度 —— 已修（按字节数）
+- 判定从行数改为**响应字节数** `len(raw) < window_target`；`window_target`
+  语义改为字节数（默认 `frame_bytes×4`）——行数在高样本率少序列库恒小会误判
+  稀疏 → 窗口翻倍到上限 → 周期触碰 N15 震荡；字节数同时正比于导出开销与
+  N15 内存上限，判定与风险同源；
+- 测试：TestPollerUnderfillByBytes（2 行 12KB/窗 ≥ 5KB 目标 → 判稠密、streak
+  复位、窗口不翻倍）；既有测试阈值同步改字节语义。
+
+### R3（P3）文档措辞 —— 已修
+- architecture.md / plan.md / README.md "空窗翻倍"→"欠满窗口翻倍"（含双档上限
+  说明）；operations.md 补 `prefetch discarded (cursor mismatch)` 日志与
+  export 失败复位行为说明。
+
+### R4（P3）测试计数 —— 已修
+- audit-v020-2026-08.md 更正为 7 个新测试函数 + 1 修改断言 + e2e 设施修复。
+
+### R5（P3）超限报错信息 —— 已修
+- 报错带窗口跨度：`exceeds %dMB for %.1fs window ... reduce max_window or window,
+  or split the source match`（基础窗口仍超限时提示拆分 match 源）。
+
+### R6（P4）预取守卫 —— 已修
+- launchPrefetch 补 `underfillStreak==0 && nw>MaxWindow` 封顶（与 pollOnce 同款）；
+- 内存峰值（预取结果与当前轮 raw 并存 ≤1GB）已记入架构说明。
+
+### R7（P4）水位默认值 —— 已修
+- WatermarkDuration() 默认 10s→1s，与 PollerConfig 一致（backfill=0 首启游标
+  =now-1s，不再多爬 9s）。
+
+### 复验入口
+- 全量 `go test ./...`、`go vet ./...`、`go test -race ./internal/...` 通过；
+- fork 同步移植同批修复（待提交，见 fork FORK.md）。

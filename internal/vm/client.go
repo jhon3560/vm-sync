@@ -74,6 +74,16 @@ func NewClient(cfg Config) (*Client, error) {
 	}, nil
 }
 
+// withTimeout R1：让 source.timeout 真正生效——调用方 ctx 无 deadline 时套用
+// c.timeout；已有 deadline（如 receiver 按批大小动态超时）则尊重调用方，避免
+// 大 batch 被配置值 10s 截断（influx-sync do() 同款语义）。
+func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.timeout)
+}
+
 // secFloat 将毫秒时间戳格式化为秒（6 位小数，保留毫秒精度）。
 func secFloat(ms int64) string {
 	return strconv.FormatFloat(float64(ms)/1000, 'f', 6, 64)
@@ -87,6 +97,8 @@ var maxExportRespBytes = 512 << 20
 // （格式与 /api/v1/import 完全对称，可原样写入目标）。上限 512MB 防异常，
 // 超限显式报错（N15，提示调低 max_window）。
 func (c *Client) ExportRange(ctx context.Context, start, end int64) ([]byte, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 	q := url.Values{}
 	for _, m := range c.cfg.Match {
 		q.Add("match[]", m)
@@ -109,8 +121,8 @@ func (c *Client) ExportRange(ctx context.Context, start, end int64) ([]byte, err
 		return nil, fmt.Errorf("vm: read export: %w", err)
 	}
 	if len(body) > maxExportRespBytes {
-		return nil, fmt.Errorf("vm: export response exceeds %dMB (window too large for data density; reduce max_window)",
-			maxExportRespBytes>>20)
+		return nil, fmt.Errorf("vm: export response exceeds %dMB for %.1fs window (data too dense; reduce max_window or window, or split the source match)",
+			maxExportRespBytes>>20, float64(end-start)/1000)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vm: export http %d: %s", resp.StatusCode, truncate(string(body), 512))
@@ -120,6 +132,8 @@ func (c *Client) ExportRange(ctx context.Context, start, end int64) ([]byte, err
 
 // ExportHasData 探测 [start, end)（毫秒）内是否有任何样本（读到首行即返回）。
 func (c *Client) ExportHasData(ctx context.Context, start, end int64) (bool, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 	q := url.Values{}
 	for _, m := range c.cfg.Match {
 		q.Add("match[]", m)
@@ -188,6 +202,8 @@ func (c *Client) ImportWrite(ctx context.Context, raw []byte) error {
 	if len(raw) == 0 {
 		return nil
 	}
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 	u := fmt.Sprintf("%s/api/v1/import", c.cfg.URL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
 	if err != nil {

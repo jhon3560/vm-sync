@@ -5,7 +5,8 @@
 | 日志 | 含义 |
 |---|---|
 | `poll window start=… end=… frames=N` | 每轮 export 查询与分块 |
-| `export failed, keep cursor` | 源查询失败（保持游标，下轮重试） |
+| `export failed, keep cursor` | 源查询失败（保持游标，下轮重试；V0.2 起失败同时复位窗口增长，下轮回基础窗口自愈） |
+| `prefetch discarded (cursor mismatch), re-export`（Debug） | N16 预取槽与当前游标不符（上一轮失败未推进）→ 丢弃同步重查，正常防御路径非错误 |
 | `ack success seq=N` / `retry frame seq=N` | 发送进度/重试 |
 | `frame written seq=N` | 落库成功 |
 | `poison packet isolated to DLQ` | import 4xx 毒丸隔离（含 http_status） |

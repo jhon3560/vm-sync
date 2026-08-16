@@ -46,7 +46,7 @@ internal/protocol ISFP 帧编解码（gzip/zstd）
 internal/transport TCP 停等客户端 / 流水线服务端
 internal/wal      分段 WAL（group commit + 撕裂尾恢复 + backfill 回拨策略）
 internal/vm       VictoriaMetrics 客户端（export/import/最早数据探测）
-internal/sender   Poller（export 窗口 + 空窗跳过 + 分块）
+internal/sender   Poller（export 窗口 + 欠满窗口翻倍跳过 + 分块）
 internal/receiver 帧处理（去重/DLQ/import 写库）
 internal/monitor  Prometheus 指标
 internal/config   配置加载（d 时长单位、backfill all/0/Nd）

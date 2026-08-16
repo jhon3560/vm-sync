@@ -27,7 +27,8 @@ type PollerConfig struct {
 	MaxWindow    time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
 	FrameLines   int           // 每帧最多 export 行数（每行可含多样本），默认 5000
 	FrameBytes   int           // 每帧压缩前字节上限，默认 512KB
-	WindowTarget int           // N14 窗口增长目标行数（默认=FrameLines×4）：欠满判定阈值，
+	WindowTarget int           // N14/R2 窗口增长目标**字节数**（默认=FrameBytes×4）：欠满判定
+	                          // 阈值，按 export 响应字节数判定（行数在高样本率少序列库会误判），
 	                          // 与帧大小解耦——稀疏库窗口不被帧行数锁死
 	Compression  uint8         // 数据帧类型（protocol.TypeData=gzip / TypeDataZstd=zstd），默认 zstd
 }
@@ -106,7 +107,7 @@ func NewPoller(client *vm.Client, w *wal.WAL, metrics *monitor.Metrics, logger *
 		cfg.FrameBytes = 512 << 10
 	}
 	if cfg.WindowTarget <= 0 {
-		cfg.WindowTarget = cfg.FrameLines * 4
+		cfg.WindowTarget = cfg.FrameBytes * 4 // 默认按字节目标：4×帧字节
 	}
 	if cfg.Compression == 0 {
 		cfg.Compression = protocol.TypeDataZstd
@@ -204,17 +205,6 @@ func (p *Poller) windowSize() time.Duration {
 	return w
 }
 
-// lineCount 统计 export 响应行数（欠满判定用）。
-func lineCount(raw []byte) int {
-	n := 0
-	for _, b := range raw {
-		if b == '\n' {
-			n++
-		}
-	}
-	return n
-}
-
 // pollOnce 执行一轮 export 查询 → 分块 → WAL → 推进游标（先 WAL 后游标铁律）。
 func (p *Poller) pollOnce(ctx context.Context) {
 	now := time.Now().UnixMilli()
@@ -241,8 +231,15 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		p.prefetch = nil
 		if slot.cursor == cursor {
 			end = slot.end
-			r := <-slot.ch
-			raw, err = r.raw, r.err
+			// R1：裸接收改为 ctx 可选等待——关停/取消时立即返回，不阻塞在
+			// 预取查询上（源 VM 挂起时预取可能 10s 级延迟）；goroutine 结果
+			// 写入 buffered channel（cap 1）后自然回收，无泄漏。
+			select {
+			case r := <-slot.ch:
+				raw, err = r.raw, r.err
+			case <-ctx.Done():
+				return
+			}
 		} else {
 			p.logger.Debug("prefetch discarded (cursor mismatch), re-export",
 				zap.Int64("slot_cursor", slot.cursor), zap.Int64("cursor", cursor))
@@ -263,13 +260,15 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	// N16：立即启动下一窗口预取（与下方分块/编码/WAL 并行，隐藏 export 延迟）。
 	// 放在欠满判定之后：窗口估算用刚观测到的密度（streak 已更新）。
 	frames := splitFrames(raw, p.cfg.FrameLines, p.cfg.FrameBytes)
-	// N14：欠满计数——空窗或行数 < 增长目标的稀疏窗均翻倍跳过；
-	// 命中稠密数据（≥ 增长目标）复位。
+	// N14/R2：欠满计数按**响应字节数**判定（空窗或字节数 < 增长目标的稀疏窗
+	// 均翻倍跳过）——不用行数：VM export 单行可含大量样本，少序列×高样本率库
+	// 行数恒小会被误判稀疏 → 窗口翻倍到上限 → 周期触碰 N15 超限震荡。
+	// 命中稠密数据（≥ 增长目标字节）复位。
 	switch {
 	case len(frames) == 0:
 		p.underfillStreak++
 		// streakAllEmpty 保持（空窗不改变"全空"性质）
-	case lineCount(raw) < p.cfg.WindowTarget:
+	case len(raw) < p.cfg.WindowTarget:
 		p.underfillStreak++
 		p.streakAllEmpty = false
 	default:
@@ -326,6 +325,11 @@ func (p *Poller) launchPrefetch(ctx context.Context, cursor int64) {
 		return // 已有预取在途
 	}
 	nw := p.windowSize()
+	// R6：与 pollOnce 同款守卫——非增长态下窗口不得越过 MaxWindow
+	// （防误配置 Window > MaxWindow 时预取窗口与轮询窗口不一致）。
+	if p.underfillStreak == 0 && nw > p.cfg.MaxWindow {
+		nw = p.cfg.MaxWindow
+	}
 	ne := cursor + nw.Milliseconds()
 	if maxEnd := time.Now().UnixMilli() - p.cfg.Watermark.Milliseconds(); ne > maxEnd {
 		ne = maxEnd
