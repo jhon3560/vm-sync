@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,10 +123,243 @@ func TestPollerBackfillAllZeroLoss(t *testing.T) {
 	if w.Cursor() < dataEnd {
 		t.Fatalf("cursor=%d want>=%d", w.Cursor(), dataEnd)
 	}
-	// 所有样本都已进 WAL（帧未发送，pending=帧数）：每 0.5s 窗口一帧（每窗口 5 行 < FrameLines）
+	// 所有样本都已进 WAL（帧未发送，pending=帧数）。N14 起稀疏数据（每窗 5 行
+	// < 增长目标 400 行）窗口翻倍到 MaxWindow(30s) 封顶 → 帧数远少于逐 0.5s 窗
+	// （~9 帧 vs ~78 帧），但游标追平 ⟹ 数据全量在 WAL（先 WAL 后游标铁律）。
 	pending := w.PendingCount()
 	wantFrames := (dataEnd - oldest) / 500
-	if pending == 0 || pending < int(wantFrames)-2 || pending > int(wantFrames)+2 {
-		t.Fatalf("pending=%d want≈%d", pending, wantFrames)
+	if pending == 0 || pending > int(wantFrames) {
+		t.Fatalf("pending=%d want in [1, %d]", pending, wantFrames)
+	}
+}
+
+// sparseSource 稀疏数据假 VM 源：仅每 10s 一行，数据区 [0, 6h)。
+func sparseSource(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		if end > int64(6*time.Hour/time.Millisecond) {
+			end = int64(6 * time.Hour / time.Millisecond)
+		}
+		var rows []string
+		first := (start + 9999) / 10000 * 10000
+		for ts := first; ts < end; ts += 10000 {
+			rows = append(rows, fmt.Sprintf(`{"metric":{"__name__":"sparse"},"values":[1],"timestamps":[%d]}`, ts))
+		}
+		fmt.Fprint(w, strings.Join(rows, "\n"))
+		if len(rows) > 0 {
+			fmt.Fprint(w, "\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPollerSparseWindowGrowth N14 回归：稀疏数据（行数 << 增长目标）的窗口必须
+// 与空窗一样翻倍（封顶 MaxWindow）——修复前稀疏库回填被基础窗口封顶
+// （influx-sync 实测稀疏库修复前需十几天）。
+func TestPollerSparseWindowGrowth(t *testing.T) {
+	srv := sparseSource(t)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
+		FrameLines: 10, WindowTarget: 100,
+	})
+	// 稀疏 0.1 行/s：每窗 < 100 目标 → 翻倍至 MaxWindow(30s) 封顶。
+	// 12 轮后游标应远超 12×5s=60s（修复前约 60s）。
+	for i := 0; i < 12; i++ {
+		p.pollOnce(context.Background())
+	}
+	if w.Cursor() < int64(300*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d want >= %d (sparse window must grow to MaxWindow)", w.Cursor(), int64(300*time.Second/time.Millisecond))
+	}
+}
+
+// TestPollerPrefetchPipeline N16 回归：单窗口轮次的下一窗口 export 在处理本轮时
+// 已在途；多轮后游标正确推进、数据全量入 WAL。
+func TestPollerPrefetchPipeline(t *testing.T) {
+	var mu sync.Mutex
+	var queryCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		queryCount++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond) // 模拟 export 延迟
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		var rows []string
+		for ts := start + 100; ts < end; ts += 250 { // 4 行/s，5s 窗 = 20 行
+			rows = append(rows, fmt.Sprintf(`{"metric":{"__name__":"dense"},"values":[1],"timestamps":[%d]}`, ts))
+		}
+		fmt.Fprint(w, strings.Join(rows, "\n"))
+		if len(rows) > 0 {
+			fmt.Fprint(w, "\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 5 * time.Second,
+		FrameLines: 1000, WindowTarget: 10, // 每窗 20 行 ≥ 10 → streak 恒 0，窗口恒 5s（预取路径）
+	})
+	const rounds = 6
+	for i := 0; i < rounds; i++ {
+		p.pollOnce(context.Background())
+	}
+	if w.Cursor() != int64(rounds*5*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d want %d", w.Cursor(), int64(rounds*5*time.Second/time.Millisecond))
+	}
+	if w.PendingCount() == 0 {
+		t.Fatal("data must land in wal")
+	}
+	mu.Lock()
+	qc := queryCount
+	mu.Unlock()
+	// 预取生效：6 轮 + 最多 1 个在途预取 = 7 次 export；无预取恒等于轮数。
+	if qc > rounds+1 {
+		t.Fatalf("query count=%d want <= %d (prefetch storms?)", qc, rounds+1)
+	}
+}
+
+// TestPollerPrefetchDiscardOnMismatch N16 防御：预取槽游标与当前游标不符
+// （上一轮处理失败未推进）→ 丢弃并同步重查，不得跳过窗口（零丢失）。
+func TestPollerPrefetchDiscardOnMismatch(t *testing.T) {
+	var queryCount int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&queryCount, 1)
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		var rows []string
+		for ts := start + 100; ts < end; ts += 500 {
+			rows = append(rows, fmt.Sprintf(`{"metric":{"__name__":"m"},"values":[1],"timestamps":[%d]}`, ts))
+		}
+		fmt.Fprint(w, strings.Join(rows, "\n"))
+		if len(rows) > 0 {
+			fmt.Fprint(w, "\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 5 * time.Second,
+		FrameLines: 1000, WindowTarget: 1000,
+	})
+	// 注入一个游标不符的预取槽（模拟上一轮失败后残留）
+	p.prefetch = &prefetchSlot{cursor: int64(99 * 1000), end: int64(104 * 1000), ch: make(chan prefetchResult, 1)}
+	p.prefetch.ch <- prefetchResult{raw: nil, err: nil}
+	qBefore := atomic.LoadInt32(&queryCount)
+	p.pollOnce(context.Background())
+	// 失配 → 同步重查 [0,5s)（+1），随后下一窗口预取（+1）——断言重查发生
+	if atomic.LoadInt32(&queryCount) < qBefore+1 {
+		t.Fatalf("query count=%d want >= %d (mismatch must re-export)", atomic.LoadInt32(&queryCount), qBefore+1)
+	}
+	if w.Cursor() != int64(5*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d want %d", w.Cursor(), int64(5*time.Second/time.Millisecond))
+	}
+}
+
+// TestPollerExportErrorResetsStreak N15 回归：export 失败复位窗口增长——
+// 下轮回基础窗口自愈，避免大窗口持续失败停滞。
+func TestPollerExportErrorResetsStreak(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		if end-start > int64(10*time.Second/time.Millisecond) {
+			http.Error(w, "window too large", http.StatusInternalServerError)
+			return
+		}
+		var rows []string
+		for ts := start + 100; ts < end; ts += 250 {
+			rows = append(rows, fmt.Sprintf(`{"metric":{"__name__":"m"},"values":[1],"timestamps":[%d]}`, ts))
+		}
+		fmt.Fprint(w, strings.Join(rows, "\n"))
+		if len(rows) > 0 {
+			fmt.Fprint(w, "\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
+		FrameLines: 1000, WindowTarget: 1000,
+	})
+	p.underfillStreak = 3 // 窗口已翻倍到 40s（> 假源 10s 上限）
+	p.streakAllEmpty = false
+	p.pollOnce(context.Background())
+	if w.Cursor() != 0 {
+		t.Fatalf("failed round must keep cursor, got %d", w.Cursor())
+	}
+	if p.underfillStreak != 0 || !p.streakAllEmpty {
+		t.Fatalf("export failure must reset streak: streak=%d allEmpty=%v", p.underfillStreak, p.streakAllEmpty)
+	}
+	// 复位后基础窗口（5s ≤ 10s 上限）成功推进
+	p.pollOnce(context.Background())
+	if w.Cursor() != int64(5*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d want %d (self-heal with base window)", w.Cursor(), int64(5*time.Second/time.Millisecond))
 	}
 }

@@ -3,6 +3,7 @@ package integration
 
 import (
 	"context"
+	"io"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -108,9 +109,14 @@ func TestEndToEndSyncAndBackfill(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		buf := make([]byte, 4<<20)
-		n, _ := r.Body.Read(buf)
-		body := string(buf[:n])
+		// N14 修复：大帧（>4KB）必须 io.ReadAll 整读——单次 Body.Read 只返回
+		// 服务端首块缓冲（~4KB），截断后静默丢尾部行（此前帧小从未暴露）。
+		bb, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body := string(bb)
 		mu.Lock()
 		payloads = append(payloads, body)
 		for _, line := range strings.Split(strings.TrimSpace(body), "\n") {

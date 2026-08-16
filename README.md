@@ -1,6 +1,6 @@
 # vm-sync
 
-VictoriaMetrics 跨正向隔离同步系统（ISFP 协议，v0.1.0）。
+VictoriaMetrics 跨正向隔离同步系统（ISFP 协议，v0.2.0）。
 
 **功能**：安全区 I 的 VictoriaMetrics → 正向隔离装置（TCP 映射）→ 安全区 III 的
 VictoriaMetrics，单向、有序、At-Least-Once、断点续传同步。

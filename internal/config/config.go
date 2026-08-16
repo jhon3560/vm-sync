@@ -52,7 +52,10 @@ type SenderConfig struct {
 		MaxWindow  string `yaml:"max_window"`  // 单轮窗口上限（防时间跳变，默认 30s）
 		FrameLines int    `yaml:"frame_lines"` // 每帧最多 export 行数（每行可含多样本），默认 5000
 		FrameBytes int    `yaml:"frame_bytes"` // 每帧压缩前字节上限，默认 512KB
-		Backfill   string `yaml:"backfill"`    // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
+		// WindowTarget 窗口增长目标行数（V0.2/N14，默认=frame_lines×4）：欠满判定阈值，
+		// 与帧大小解耦——稀疏库窗口仍按大数据量目标增长，不被帧行数锁死。
+		WindowTarget int    `yaml:"window_target"`
+		Backfill     string `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -190,7 +193,6 @@ func (c *SenderConfig) Validate() error {
 		"sync.window":               c.Sync.Window,
 		"sync.watermark":            c.Sync.Watermark,
 		"sync.max_window":           c.Sync.MaxWindow,
-		"sync.backfill":             c.Sync.Backfill,
 		"tcp.timeout":               c.TCP.Timeout,
 		"tcp.dial_timeout":          c.TCP.DialTimeout,
 		"sender.backoff_base":       c.Sender.BackoffBase,
@@ -204,12 +206,19 @@ func (c *SenderConfig) Validate() error {
 	if c.Sender.Pipeline < 0 {
 		return fmt.Errorf("config: sender.pipeline_window must be >= 0")
 	}
+	if c.Sync.WindowTarget < 0 {
+		return fmt.Errorf("config: sync.window_target must be >= 0")
+	}
 	if cp := c.TCP.Compression; cp != "" && cp != "zstd" && cp != "gzip" {
 		return fmt.Errorf("config: tcp.compression must be zstd/gzip, got %q", cp)
 	}
 	if b := strings.TrimSpace(c.Sync.Backfill); b != "" && b != "all" && b != "0" {
-		if _, err := parseDurationExt(b); err != nil {
+		d, err := parseDurationExt(b)
+		if err != nil {
 			return fmt.Errorf("config: sync.backfill must be all/0/时长(如 30d), got %q", b)
+		}
+		if d < 0 {
+			return fmt.Errorf("config: sync.backfill: negative duration %q not allowed", b)
 		}
 	}
 	return nil
@@ -320,13 +329,14 @@ func parseDurationExt(s string) (time.Duration, error) {
 // PollerConfig 转换。
 func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 	return sender.PollerConfig{
-		Interval:    dur(c.Sync.Interval, 500*time.Millisecond),
-		Window:      dur(c.Sync.Window, 5*time.Second),
-		Watermark:   dur(c.Sync.Watermark, time.Second),
-		MaxWindow:   dur(c.Sync.MaxWindow, 30*time.Second),
-		FrameLines:  c.Sync.FrameLines,
-		FrameBytes:  c.Sync.FrameBytes,
-		Compression: c.CompressionFrameType(),
+		Interval:     dur(c.Sync.Interval, 500*time.Millisecond),
+		Window:       dur(c.Sync.Window, 5*time.Second),
+		Watermark:    dur(c.Sync.Watermark, time.Second),
+		MaxWindow:    dur(c.Sync.MaxWindow, 30*time.Second),
+		FrameLines:   c.Sync.FrameLines,
+		FrameBytes:   c.Sync.FrameBytes,
+		WindowTarget: c.Sync.WindowTarget,
+		Compression:  c.CompressionFrameType(),
 	}
 }
 

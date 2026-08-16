@@ -162,3 +162,24 @@ func TestLastSampleTimestamp(t *testing.T) {
 		t.Fatalf("single-line last ts=%d want 3210", got)
 	}
 }
+
+// TestExportRespTooLarge N15 回归：export 响应超过上限必须显式报错（可操作提示），
+// 不得静默截断成半截 JSON lines 落库丢尾部数据。
+func TestExportRespTooLarge(t *testing.T) {
+	old := maxExportRespBytes
+	maxExportRespBytes = 1024
+	defer func() { maxExportRespBytes = old }()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"metric":{"__name__":"m"},"values":[1],"timestamps":[0]}`+"\n"+strings.Repeat("x", 2048)+"\n")
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	_, err := c.ExportRange(context.Background(), 0, 1000)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected truncation error with guidance, got %v", err)
+	}
+}

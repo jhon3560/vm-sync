@@ -79,8 +79,13 @@ func secFloat(ms int64) string {
 	return strconv.FormatFloat(float64(ms)/1000, 'f', 6, 64)
 }
 
+// maxExportRespBytes 单次 export 响应上限（N15：静默截断会产出半截 JSON lines，
+// 落库后静默丢尾部数据——必须显式报错并让上层缩小窗口重试）。var 以便测试注入。
+var maxExportRespBytes = 512 << 20
+
 // ExportRange 拉取 [start, end)（毫秒）内全部原始样本，返回 JSON lines 原文
-// （格式与 /api/v1/import 完全对称，可原样写入目标）。上限 512MB 防异常。
+// （格式与 /api/v1/import 完全对称，可原样写入目标）。上限 512MB 防异常，
+// 超限显式报错（N15，提示调低 max_window）。
 func (c *Client) ExportRange(ctx context.Context, start, end int64) ([]byte, error) {
 	q := url.Values{}
 	for _, m := range c.cfg.Match {
@@ -99,9 +104,13 @@ func (c *Client) ExportRange(ctx context.Context, start, end int64) ([]byte, err
 		return nil, fmt.Errorf("vm: export [%d,%d): %w", start, end, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxExportRespBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("vm: read export: %w", err)
+	}
+	if len(body) > maxExportRespBytes {
+		return nil, fmt.Errorf("vm: export response exceeds %dMB (window too large for data density; reduce max_window)",
+			maxExportRespBytes>>20)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vm: export http %d: %s", resp.StatusCode, truncate(string(body), 512))
