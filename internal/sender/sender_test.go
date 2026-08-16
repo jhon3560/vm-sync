@@ -2,6 +2,7 @@ package sender
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,19 +17,33 @@ import (
 
 // ackServer 可控 ACK 行为的假 Receiver（移植自 influx-sync sender 测试，本轮新增
 // sender 单测覆盖：停等/重试不丢/退避/滑窗——此前 sender 完全无单测，pipeline
-// 路径零覆盖）。alwaysNack=恒 0x00；否则仅对 seq==nackOnceSeq 的帧 nack 一次
-// （按帧头 seq 判定——server 对帧的处理顺序不保证与 seq 一致，按收到次序判定
-// 会有竞态），其余 0xff。
-func ackServer(t *testing.T, alwaysNack bool, nackOnceSeq uint64) (addr string, received *atomic.Int64) {
+// 路径零覆盖）。
+// - alwaysNack：恒 0x00；
+// - 否则仅对 seq==nackOnceSeq 的帧 nack 一次（按帧头 seq 判定——server 对帧的
+//   处理顺序不保证与 seq 一致，按收到次序判定会有竞态），其余 0xff；
+// - nackConnPersistent（R12）：nack 之后该连接上所有后续帧恒 0x00（模拟真实
+//   receiver 对同一帧持续 import 失败的场景）——无 N1 Close 的客户端会在死连接
+//   上无限重试无法收敛，测试借此捕获 ACK 错位回归。
+func ackServer(t *testing.T, alwaysNack bool, nackOnceSeq uint64, nackConnPersistent bool) (addr string, received *atomic.Int64) {
 	t.Helper()
 	received = &atomic.Int64{}
 	var nacked atomic.Bool
+	var deadMu sync.Mutex
+	dead := map[uint64]bool{}
 	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, _ uint64, fb []byte) byte {
 		received.Add(1)
-		if alwaysNack {
+		deadMu.Lock()
+		isDead := dead[id]
+		deadMu.Unlock()
+		if alwaysNack || isDead {
 			return protocol.AckFail
 		}
 		if h, err := protocol.ParseHeader(fb); err == nil && h.Seq == nackOnceSeq && nacked.CompareAndSwap(false, true) {
+			if nackConnPersistent {
+				deadMu.Lock()
+				dead[id] = true
+				deadMu.Unlock()
+			}
 			return protocol.AckFail
 		}
 		return protocol.AckSuccess
@@ -62,7 +77,7 @@ func newSenderEnv(t *testing.T) (*wal.WAL, *monitor.Metrics) {
 
 // TestSenderNormalAck 停等正常路径：两帧全部 ACK → WAL 排空。
 func TestSenderNormalAck(t *testing.T) {
-	addr, received := ackServer(t, false, 0)
+	addr, received := ackServer(t, false, 0, false)
 	w, m := newSenderEnv(t)
 	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 2 * time.Second})
 	s := NewSender(w, client, m, zap.NewNop(), SenderConfig{IdleSleep: 20 * time.Millisecond, HeartbeatInterval: time.Hour})
@@ -84,7 +99,7 @@ func TestSenderNormalAck(t *testing.T) {
 // TestSenderNackNeverDrops At-Least-Once 红线：持续 0x00 重试超限后帧必须留在
 // WAL，绝不丢弃（毒丸由 receiver 侧 DLQ 隔离）。
 func TestSenderNackNeverDrops(t *testing.T) {
-	addr, _ := ackServer(t, true, 0) // 恒 nack
+	addr, _ := ackServer(t, true, 0, false) // 恒 nack
 	w, m := newSenderEnv(t)
 	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 2 * time.Second})
 	s := NewSender(w, client, m, zap.NewNop(), SenderConfig{
@@ -106,7 +121,7 @@ func TestSenderNackNeverDrops(t *testing.T) {
 
 // TestSenderRetryRecovers nack 一次后 ack → 重试成功、WAL 排空。
 func TestSenderRetryRecovers(t *testing.T) {
-	addr, received := ackServer(t, false, 1) // seq=1 帧 nack 一次 → 重试成功
+	addr, received := ackServer(t, false, 1, false) // seq=1 帧 nack 一次 → 重试成功
 	w, m := newSenderEnv(t)
 	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 2 * time.Second})
 	s := NewSender(w, client, m, zap.NewNop(), SenderConfig{
@@ -151,7 +166,7 @@ func TestSenderDisconnectKeepsWAL(t *testing.T) {
 
 // TestSenderPipelineAcksInOrder 滑窗（A1）：pipeline=2 两帧在途按序 ACK 全确认。
 func TestSenderPipelineAcksInOrder(t *testing.T) {
-	addr, received := ackServer(t, false, 0)
+	addr, received := ackServer(t, false, 0, false)
 	w, m := newSenderEnv(t)
 	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 2 * time.Second})
 	s := NewSender(w, client, m, zap.NewNop(), SenderConfig{
@@ -175,7 +190,9 @@ func TestSenderPipelineAcksInOrder(t *testing.T) {
 // TestSenderPipelineGoBackN 滑窗第 k 帧 0x00 → 连接级失败重连 + go-back-N 重发
 // 尾窗（N1 语义：关连接排干陈旧 ACK，杜绝 ACK 错位提交未写库帧）。
 func TestSenderPipelineGoBackN(t *testing.T) {
-	addr, received := ackServer(t, false, 2) // seq=2 帧 nack 一次 → go-back-N 重发尾窗
+	// R12：nack 连接持续 0x00——只有 N1 的 Close+重连才能收敛（尾窗在
+	// 新连接上重发）；移除 Close 的客户端会在死连接上无限重试，测试必失败。
+	addr, received := ackServer(t, false, 2, true)
 	w, m := newSenderEnv(t)
 	w3, err := w.Append(protocol.TypeData, []byte(`{"metric":{"__name__":"m"},"values":[3],"timestamps":[3]}`))
 	if err != nil {
@@ -200,9 +217,10 @@ func TestSenderPipelineGoBackN(t *testing.T) {
 	if w.PendingCount() != 0 {
 		t.Fatalf("go-back-N must converge: pending=%d received=%d", w.PendingCount(), received.Load())
 	}
-	// 3 帧首轮 + 第 2 帧 0x00 触发 go-back-N 重发尾窗（第 2/3 帧）= 5 次发送
-	if received.Load() < 5 {
-		t.Fatalf("expected >=5 sends (3 + 尾窗重发 2), got %d", received.Load())
+	// 正确路径发送次数确定：首轮 3 + 新连接尾窗重发 2 = 5；死连接重试不计数
+	// （帧未被 server 收到）。received > 6 说明在死连接上打转（N1 回归）。
+	if r := received.Load(); r < 5 || r > 6 {
+		t.Fatalf("expected 5~6 sends (3 + 尾窗重发 2), got %d", r)
 	}
 	if m.DLQCount() != 0 {
 		t.Fatalf("dlq must be 0, got %d", m.DLQCount())

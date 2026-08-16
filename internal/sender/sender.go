@@ -15,7 +15,7 @@ import (
 
 // SenderConfig 发送主循环配置。
 type SenderConfig struct {
-	MaxRetry          int           // 连续失败上限，超过转 DLQ，默认 10
+	MaxRetry          int           // 连续失败告警阈值（R14：发送端永不 DLQ——重试超限只告警、退避封顶、绝不丢弃），默认 10
 	BackoffBase       time.Duration // 退避基数，默认 1s
 	BackoffMax        time.Duration // 退避上限，默认 60s
 	HeartbeatInterval time.Duration // 心跳间隔，默认 30s
@@ -23,7 +23,8 @@ type SenderConfig struct {
 	Pipeline          int           // 滑窗大小（A1 实验项），默认 1=停等。>1 时同连接多帧在途
 }
 
-// Sender 停等发送器：WAL 取帧 → TCP 发送 → 等 ACK → 提交/重试/DLQ。
+// Sender 停等发送器：WAL 取帧 → TCP 发送 → 等 ACK → 提交/重试（R14：绝不丢弃，
+// 毒丸由 receiver 侧 DLQ 隔离后回 0xff，发送端只负责 At-Least-Once 重试）。
 // Pipeline>1 时进入滑窗模式（go-back-N）：吞吐 = W×batch/RTT，
 // 需与隔离装置确认允许同连接多请求在途后再开启。
 type Sender struct {
