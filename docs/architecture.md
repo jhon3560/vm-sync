@@ -32,6 +32,18 @@ VictoriaMetrics 的 `/api/v1/export`（查询）与 `/api/v1/import`（写入）
   且比 LP 透传更彻底：连行都不用解析）；
 - 目标 VM 对同 series+ts 覆盖写（last-wins）→ 重发/重爬幂等，计数不重复。
 
+### 2.1 预取流水线与内存边界（V0.2/N16）
+
+- 单窗口轮次的下一窗口 export 在处理本轮时已在途（隐藏源查询延迟）；消费轮
+  直接采用预取槽的窗口边界（streak 每轮变化，重算必失配），仅槽游标与当前
+  游标不符（上一轮失败未推进）才丢弃同步重查——零丢失兜底；预取窗口 ≤
+  max_window 门控（非增长态），消费轮窗口有界不变量保持。
+- **内存峰值**：预取结果（≤ maxExportRespBytes=512MB）与当前轮 raw（≤512MB）
+  经 buffered channel 并存，另加 splitFrames 分块拷贝，峰值约 1GB 量级
+  （R6 记录在案；实际由 max_window × 数据密度主导，N15 超限即报错缩小窗口）。
+- 消费轮等待预取结果受 ctx 保护（`select{slot/ctx.Done}`），关停/取消不阻塞；
+  export/probe/import 全部挂载 `source.timeout`（调用方已有 deadline 时尊重调用方）。
+
 ## 3. 可靠性机制（与 influx-sync 同款）
 
 | 机制 | 说明 |

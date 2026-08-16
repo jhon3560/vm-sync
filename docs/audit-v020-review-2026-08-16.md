@@ -132,6 +132,17 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 - WatermarkDuration() 默认 10s→1s，与 PollerConfig 一致（backfill=0 首启游标
   =now-1s，不再多爬 9s）。
 
+### 追加（实现方自查，第二轮目标回合内）
+
+- **R8（文档示例与解析不符，自查发现）**：configuration.md 示例 `frame_bytes: 512KB`
+  是普通 int 字段，yaml 直接 Unmarshal 报 `cannot unmarshal !!str into int`
+  （v0.1.0 起就存在的文档-代码不符，我新写的 `window_target: 2MB` 同病）。
+  修复：新增 `ByteSize` 类型（UnmarshalYAML 接受整数或 KB/MB/GB 单位串），
+  frame_bytes/window_target 改用之，示例写法从此真实可加载。
+  测试：TestByteSizeYAML（6 合法+3 非法）/ TestByteSizeYAMLLoad（完整 yaml）。
+- R6 声称"内存峰值已记入架构说明"此前未落地——architecture.md 补 §2.1
+  （预取流水线、内存边界 ~1GB、ctx 保护、source.timeout 语义）。
+
 ### 复验入口
 - 全量 `go test ./...`、`go vet ./...`、`go test -race ./internal/...` 通过；
 - fork 同步移植同批修复（待提交，见 fork FORK.md）。

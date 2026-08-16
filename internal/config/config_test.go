@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -39,5 +40,55 @@ func TestWindowTargetValidates(t *testing.T) {
 	c.Sync.WindowTarget = -1
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "window_target") {
 		t.Fatalf("negative window_target must be rejected, got %v", err)
+	}
+}
+
+// TestByteSizeYAML 文档示例 "512KB"/"2MB" 写法必须可解析（修复前 int 字段
+// 直接 Unmarshal 报 cannot unmarshal !!str）。
+func TestByteSizeYAML(t *testing.T) {
+	cases := map[string]int{
+		"512KB":    512 << 10,
+		"2MB":      2 << 20,
+		"1gb":      1 << 30,
+		"524288":   524288,
+		"1024B":    1024,
+		"  64 kb ": 64 << 10,
+	}
+	for in, want := range cases {
+		got, err := parseByteSize(in)
+		if err != nil || int(got) != want {
+			t.Fatalf("parseByteSize(%q)=%d,%v want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "12XB"} {
+		if _, err := parseByteSize(bad); err == nil {
+			t.Fatalf("parseByteSize(%q) must fail", bad)
+		}
+	}
+}
+
+// TestByteSizeYAMLLoad 完整 yaml 加载：frame_bytes/window_target 带单位写法。
+func TestByteSizeYAMLLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/s.yaml"
+	if err := os.WriteFile(path, []byte(`
+source:
+  url: http://127.0.0.1:8428
+sync:
+  frame_bytes: 512KB
+  window_target: 2MB
+tcp:
+  addr: 1.2.3.4:28101
+wal:
+  path: /tmp/w
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadSender(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.Sync.FrameBytes != 512<<10 || c.Sync.WindowTarget != 2<<20 {
+		t.Fatalf("frame_bytes=%d window_target=%d", c.Sync.FrameBytes, c.Sync.WindowTarget)
 	}
 }

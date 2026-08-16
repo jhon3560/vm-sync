@@ -19,6 +19,55 @@ import (
 	"vm-sync/internal/wal"
 )
 
+// ByteSize 字节数配置：YAML 接受纯整数（字节）或带单位字符串
+// （如 "512KB"、"2MB"、不区分大小写）——修复文档示例用 KB/MB 写法
+// 而 int 字段直接 Unmarshal 会报 cannot unmarshal !!str 的问题。
+type ByteSize int
+
+// UnmarshalYAML 解析整数或带单位字节串。
+func (b *ByteSize) UnmarshalYAML(node *yaml.Node) error {
+	var n int64
+	if err := node.Decode(&n); err == nil {
+		*b = ByteSize(n)
+		return nil
+	}
+	var s string
+	if err := node.Decode(&s); err != nil {
+		return fmt.Errorf("byte size must be integer bytes or string with unit (e.g. 512KB): %w", err)
+	}
+	v, err := parseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = ByteSize(v)
+	return nil
+}
+
+// parseByteSize 解析 "512KB"/"2MB"/"1GB"（单位大小写不敏感；无单位=字节）。
+func parseByteSize(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, fmt.Errorf("empty byte size")
+	}
+	upper := strings.ToUpper(t)
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		m      int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(upper, u.suffix) {
+			mult = u.m
+			t = strings.TrimSpace(t[:len(t)-len(u.suffix)])
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("bad byte size %q: %w", s, err)
+	}
+	return n * mult, nil
+}
+
 // LogConfig 日志配置。
 type LogConfig struct {
 	Level      string `yaml:"level"` // debug/info/warn/error
@@ -51,12 +100,12 @@ type SenderConfig struct {
 		Watermark  string `yaml:"watermark"`   // 水位延迟（默认 1s；VM 写入即查询可见，仅防时钟抖动）
 		MaxWindow  string `yaml:"max_window"`  // 单轮窗口上限（防时间跳变，默认 30s）
 		FrameLines int    `yaml:"frame_lines"` // 每帧最多 export 行数（每行可含多样本），默认 5000
-		FrameBytes int    `yaml:"frame_bytes"` // 每帧压缩前字节上限，默认 512KB
+		FrameBytes ByteSize `yaml:"frame_bytes"` // 每帧压缩前字节上限（支持 "512KB" 写法），默认 512KB
 		// WindowTarget 窗口增长目标字节数（V0.2/N14+R2，默认=frame_bytes×4）：欠满判定
 		// 阈值，按 export 响应字节数判定——行数在高样本率少序列库会误判稀疏导致
 		// 窗口震荡，字节数与帧大小解耦且直接对应导出开销（N15 内存上限同源）。
-		WindowTarget int    `yaml:"window_target"`
-		Backfill     string `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
+		WindowTarget ByteSize `yaml:"window_target"`
+		Backfill     string   `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -335,8 +384,8 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 		Watermark:    dur(c.Sync.Watermark, time.Second),
 		MaxWindow:    dur(c.Sync.MaxWindow, 30*time.Second),
 		FrameLines:   c.Sync.FrameLines,
-		FrameBytes:   c.Sync.FrameBytes,
-		WindowTarget: c.Sync.WindowTarget,
+		FrameBytes:   int(c.Sync.FrameBytes),
+		WindowTarget: int(c.Sync.WindowTarget),
 		Compression:  c.CompressionFrameType(),
 	}
 }
