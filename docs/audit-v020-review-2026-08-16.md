@@ -205,7 +205,7 @@ fork 侧 `go test ./app/vm-sync/...` 通过（审阅方实测）。文档应更�
 - **修复验证**：`go build -mod=vendor ./app/vm-sync/` + `go test -mod=vendor
   ./app/vm-sync/...` 全绿。教训：无测试文件的根包 `go test` 输出 `?` 易漏
   编译错误，fork 移植后必须显式 `go build` 根包；
-- fork 提交 <hash>（tag feature-isolation-sync-v0.2.3；v0.2.2=f3df219 为坏版本，
+- fork 提交 aa4df6a（tag feature-isolation-sync-v0.2.3；v0.2.2=f3df219 为坏版本，
   勿使用）。
 
 ### R10（P4）注释残留 —— 已修
