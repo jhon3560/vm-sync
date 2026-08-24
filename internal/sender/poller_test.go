@@ -86,7 +86,9 @@ func parseSec(s string) int64 {
 func TestPollerBackfillAllZeroLoss(t *testing.T) {
 	now := time.Now().UnixMilli()
 	oldest := (now - 40*time.Second.Milliseconds()) / 100 * 100
-	dataEnd := (now - time.Second.Milliseconds()) / 100 * 100
+	// R24：假源不支持 /internal/force_flush → 实时区（距 now < 15s）回退保守
+	// 收口，游标合法停在 now-15s——数据端必须取在实时区之前（now-17s）。
+	dataEnd := (now - 17*time.Second.Milliseconds()) / 100 * 100
 	src := fakeSource(t, oldest, dataEnd)
 
 	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
@@ -307,6 +309,195 @@ func TestPollerPrefetchDiscardOnMismatch(t *testing.T) {
 	}
 }
 
+// TestPollerExportLagNormalization R24 回归：有效导出可见性余量
+// = max(watermark, exportLag, 15s)——VM export 看不到 pending rows（≈4s），
+// 新序列名更要等索引 flushCallback 10s 节拍（≈10.5s）才可被查到；余量低于
+// 15s 会让游标越过不可见数据造成永久漏发。
+func TestPollerExportLagNormalization(t *testing.T) {
+	cases := []struct {
+		name      string
+		watermark time.Duration
+		exportLag time.Duration
+		wantLag   time.Duration
+		wantWM    time.Duration
+	}{
+		{"default", time.Second, 0, DefaultExportVisibilityLag, time.Second},
+		{"zero watermark", 0, 0, DefaultExportVisibilityLag, time.Second},
+		{"small explicit lag still floored", time.Second, 3 * time.Second, DefaultExportVisibilityLag, time.Second},
+		{"explicit 10s lag still floored (new-series 10.5s)", time.Second, 10 * time.Second, DefaultExportVisibilityLag, time.Second},
+		{"explicit large lag", time.Second, 20 * time.Second, 20 * time.Second, time.Second},
+		{"watermark dominates", 30 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := NewPoller(nil, nil, nil, nil, PollerConfig{Watermark: c.watermark, ExportLag: c.exportLag})
+			if p.cfg.ExportLag != c.wantLag {
+				t.Fatalf("exportLag=%v want %v", p.cfg.ExportLag, c.wantLag)
+			}
+			if p.cfg.Watermark != c.wantWM {
+				t.Fatalf("watermark=%v want %v", p.cfg.Watermark, c.wantWM)
+			}
+		})
+	}
+}
+
+// TestPollerWindowEndExportLagClamp R24 回归：窗口尾端 = min(cursor+window,
+// now-收口余量)；实时区 flush 成功按 watermark 收口，失败回退 ExportLag；
+// 非增长态下另受 MaxWindow 钳制（R6）。
+func TestPollerWindowEndExportLagClamp(t *testing.T) {
+	p := NewPoller(nil, nil, nil, nil, PollerConfig{
+		Watermark: time.Second, Window: 5 * time.Second, MaxWindow: 30 * time.Second,
+	})
+	now := time.Now().UnixMilli()
+	lagMs := p.cfg.ExportLag.Milliseconds()
+	// 回填态（cursor 远离 now）：不受可见性收口影响，end = cursor+window
+	cursor := now - int64(time.Hour/time.Millisecond)
+	if got, want := p.windowEnd(cursor, now, true), cursor+5000; got != want {
+		t.Fatalf("backfill: end=%d want %d", got, want)
+	}
+	// 实时态 + flush 成功：end 钳到 now-watermark
+	cursor = now - int64(6*time.Second/time.Millisecond)
+	if got, want := p.windowEnd(cursor, now, true), now-1000; got != want {
+		t.Fatalf("realtime flushOK: end=%d want %d", got, want)
+	}
+	// 实时态 + flush 失败：end 钳到 now-ExportLag（保守回退）
+	cursor = now - int64(6*time.Second/time.Millisecond)
+	if got, want := p.windowEnd(cursor, now, false), now-lagMs; got != want {
+		t.Fatalf("realtime flushFail: end=%d want %d", got, want)
+	}
+	// MaxWindow 钳位（非增长态 + Window 超 MaxWindow 的误配置，R6）
+	p2 := NewPoller(nil, nil, nil, nil, PollerConfig{
+		Watermark: time.Second, Window: time.Minute, MaxWindow: 10 * time.Second,
+	})
+	cursor = now - int64(time.Hour/time.Millisecond)
+	if got, want := p2.windowEnd(cursor, now, true), cursor+10000; got != want {
+		t.Fatalf("maxwindow: end=%d want %d", got, want)
+	}
+}
+
+// TestPollerRealtimeDoesNotPassVisibilityLag R24 回归（行为级）：实时区 flush
+// 失败时窗口尾端回退到 now-ExportLag——修复前窗口尾端=now-watermark(1s)，游标
+// 在数据可见（pending rows ≈4s / 新序列 ≈10.5s）前越过其时间戳，实时写入
+// 永久漏发（e2e 实测默认配置下实时写入 100% 丢失）。假源不支持 /internal/
+// force_flush（404）→ flush 必然失败 → 游标不得越过 now-15s。
+func TestPollerRealtimeDoesNotPassVisibilityLag(t *testing.T) {
+	now := time.Now().UnixMilli()
+	oldest := (now - 2*time.Minute.Milliseconds()) / 100 * 100
+	srv := fakeSource(t, oldest, now) // 数据一直写到 now（理想化源，但无 force_flush）
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(oldest); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Interval: 20 * time.Millisecond, Window: 5 * time.Second, Watermark: time.Second,
+		FrameLines: 100000, FrameBytes: 1 << 20,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+	// 游标应推进到保守余量附近（now-16s 以内，可见区数据已入 WAL）
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Cursor() >= now-int64(16*time.Second/time.Millisecond) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	nowCheck := time.Now().UnixMilli()
+	if w.Cursor() < now-int64(16*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d must advance to near now-lag", w.Cursor())
+	}
+	// 红线：flush 失败时游标任何时候都不得越过 now-15s（用 cancel 后的
+	// nowCheck 兑底 pollOnce 内部 now 略早于 nowCheck）
+	if w.Cursor() > nowCheck-p.cfg.ExportLag.Milliseconds() {
+		t.Fatalf("cursor=%d must not pass now-lag=%d", w.Cursor(), nowCheck-p.cfg.ExportLag.Milliseconds())
+	}
+	if w.PendingCount() == 0 {
+		t.Fatal("visible-zone data must land in wal")
+	}
+}
+
+// TestPollerRealtimeForceFlushTightWatermark R24 对照：实时区 force_flush 成功时
+// 窗口尾端按 watermark 收口（实时 e2e ≈1.5~2.5s 的语义恢复）——游标必须能推进
+// 到 now-1s 附近而不是停在 now-15s。
+func TestPollerRealtimeForceFlushTightWatermark(t *testing.T) {
+	now := time.Now().UnixMilli()
+	oldest := (now - 30*time.Second.Milliseconds()) / 100 * 100
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/internal/force_flush" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		if end > now {
+			end = now
+		}
+		var rows []string
+		first := (start + 99) / 100 * 100
+		for ts := first; ts < end; ts += 100 {
+			rows = append(rows, fmt.Sprintf(`{"metric":{"__name__":"cpu","job":"a"},"values":[1.5],"timestamps":[%d]}`, ts))
+		}
+		fmt.Fprint(w, strings.Join(rows, "\n"))
+		if len(rows) > 0 {
+			fmt.Fprint(w, "\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(oldest); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Interval: 20 * time.Millisecond, Window: 5 * time.Second, Watermark: time.Second,
+		FrameLines: 100000, FrameBytes: 1 << 20,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+	// flush 成功 → 游标必须能越过 now-15s、追平到 now-2s 以内
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Cursor() >= now-int64(2*time.Second/time.Millisecond) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if w.Cursor() < now-int64(2*time.Second/time.Millisecond) {
+		t.Fatalf("cursor=%d must reach near now-watermark when flush works", w.Cursor())
+	}
+	if w.PendingCount() == 0 {
+		t.Fatal("data must land in wal")
+	}
+}
 // TestPollerExportErrorResetsStreak N15 回归：export 失败复位窗口增长——
 // 下轮回基础窗口自愈，避免大窗口持续失败停滞。
 func TestPollerExportErrorResetsStreak(t *testing.T) {
@@ -413,6 +604,88 @@ func TestPollerUnderfillByBytes(t *testing.T) {
 	p.pollOnce(context.Background())
 	if w.Cursor() != int64(10*time.Second/time.Millisecond) {
 		t.Fatalf("cursor=%d want %d (no window growth for byte-dense data)", w.Cursor(), int64(10*time.Second/time.Millisecond))
+	}
+}
+
+// TestPollerOversizeLineShrinksWindow R16 回归：单条 export 行（单序列样点过密）
+// 无法成帧时，窗口逐轮减半直到单行可成帧——修复前 encode 持续失败、游标永不
+// 推进（实测 3 轮后 cursor=0，每 500ms 重复拉取同一大窗，同步永久停滞）。
+func TestPollerOversizeLineShrinksWindow(t *testing.T) {
+	// 200 值/ms 的单序列密度；值使用固定字符串而非 rand——保持单行足够大
+	// 的同时避免 race detector 下数百万次锁竞争/随机数生成拖慢到分钟级。
+	mkLine := func(startMs, endMs int64) []byte {
+		if endMs <= startMs {
+			return nil
+		}
+		var b strings.Builder
+		b.WriteString(`{"metric":{"__name__":"vib"},"values":[`)
+		for i := int64(0); startMs+i/200 < endMs; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("123456789.123456789")
+		}
+		b.WriteString(`],"timestamps":[0]}` + "\n")
+		return []byte(b.String())
+	}
+	// 数据仅存在于 [0, 6s)：请求窗口按实际数据裁剪，行大小随窗口成比例
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/export" {
+			http.NotFound(w, r)
+			return
+		}
+		start := parseSec(r.URL.Query().Get("start"))
+		end := parseSec(r.URL.Query().Get("end"))
+		if dataEnd := int64(6 * time.Second / time.Millisecond); end > dataEnd {
+			end = dataEnd
+		}
+		w.Write(mkLine(start, end))
+	}))
+	t.Cleanup(srv.Close)
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.SetCursor(0); err != nil {
+		t.Fatal(err)
+	}
+	vc, err := vm.NewClient(vm.Config{URL: srv.URL, Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New()
+	p := NewPoller(vc, w, m, zap.NewNop(), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 10 * time.Second,
+		FrameLines: 5000, WindowTarget: 5000,
+	})
+	// 5s 窗 = 1M 值 ≈ 20MB 原始：超 MaxDecompressedLen → encode 失败 → 收缩
+	failedRounds := 0
+	for i := 0; i < 20 && w.Cursor() == 0; i++ {
+		p.pollOnce(context.Background())
+		if w.Cursor() == 0 {
+			failedRounds++
+		}
+	}
+	if w.Cursor() == 0 {
+		t.Fatal("cursor stuck at 0: oversized single line not handled by window shrink")
+	}
+	if failedRounds == 0 {
+		t.Fatal("test setup: expected at least one oversize failure round")
+	}
+	t.Logf("shrunk after %d failed rounds, cursor=%d, oversizeStreak=%d",
+		failedRounds, w.Cursor(), p.oversizeStreak)
+	// 数据不得丢失：帧必须进入 WAL（先 WAL 后游标铁律）
+	if w.PendingCount() == 0 {
+		t.Fatal("frames must land in wal")
+	}
+	// 继续推进：收缩后的窗口持续成功，游标应继续前进
+	c := w.Cursor()
+	for i := 0; i < 5; i++ {
+		p.pollOnce(context.Background())
+	}
+	if w.Cursor() <= c {
+		t.Fatalf("cursor must keep advancing after shrink: %d -> %d", c, w.Cursor())
 	}
 }
 

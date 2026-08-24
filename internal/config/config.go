@@ -105,7 +105,11 @@ type SenderConfig struct {
 		// 阈值，按 export 响应字节数判定——行数在高样本率少序列库会误判稀疏导致
 		// 窗口震荡，字节数与帧大小解耦且直接对应导出开销（N15 内存上限同源）。
 		WindowTarget ByteSize `yaml:"window_target"`
-		Backfill     string   `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
+		// ExportLag 实时区导出可见性安全余量（R24）：0=自动（≥15s，覆盖 VM
+		// 新序列的最坏可见性延迟 ≈10.5s）；实时窗口先对源端 /internal/force_flush
+		// 使 pending rows/新序列立即可见，flush 失败才回退此余量。只允许调大。
+		ExportLag  string   `yaml:"export_lag"`
+		Backfill   string   `yaml:"backfill"` // 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d=天）
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -243,6 +247,7 @@ func (c *SenderConfig) Validate() error {
 		"sync.window":               c.Sync.Window,
 		"sync.watermark":            c.Sync.Watermark,
 		"sync.max_window":           c.Sync.MaxWindow,
+		"sync.export_lag":           c.Sync.ExportLag,
 		"tcp.timeout":               c.TCP.Timeout,
 		"tcp.dial_timeout":          c.TCP.DialTimeout,
 		"sender.backoff_base":       c.Sender.BackoffBase,
@@ -270,6 +275,25 @@ func (c *SenderConfig) Validate() error {
 		if d < 0 {
 			return fmt.Errorf("config: sync.backfill: negative duration %q not allowed", b)
 		}
+	}
+	return nil
+}
+
+// ValidateBackfill 校验回填开关取值（R20，供内嵌 flag 路径使用；YAML 路径已在
+// SenderConfig.Validate 拦截）。空/all/0（或 0s）=合法；其余必须是可解析的非负
+// 扩展时长——flag 路径绕过 Validate，乱输入会被 BackfillSpec 静默回退全量回填
+// （配置笔误 → 全库重发），负值同样回退全量。入口显式拒绝。
+func ValidateBackfill(s string) error {
+	b := strings.TrimSpace(s)
+	if b == "" || b == "all" || b == "0" || b == "0s" {
+		return nil
+	}
+	d, err := parseDurationExt(b)
+	if err != nil {
+		return fmt.Errorf("sync.backfill must be all/0/时长(如 30d), got %q", b)
+	}
+	if d < 0 {
+		return fmt.Errorf("sync.backfill: negative duration %q not allowed", b)
 	}
 	return nil
 }
@@ -386,8 +410,23 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 		FrameLines:   c.Sync.FrameLines,
 		FrameBytes:   int(c.Sync.FrameBytes),
 		WindowTarget: int(c.Sync.WindowTarget),
+		ExportLag:    dur(c.Sync.ExportLag, 0),
 		Compression:  c.CompressionFrameType(),
 	}
+}
+
+// EffectiveExportLag 返回导出可见性安全余量（R24）：max(watermark, export_lag, 15s)。
+// 与 sender.NewPoller 的归一化逻辑一致；供初始游标计算使用（backfill=0 时
+// 游标起点必须是 now-有效余量，否则前几轮 end<=cursor 空转且语义混乱）。
+func (c *SenderConfig) EffectiveExportLag() time.Duration {
+	lag := c.WatermarkDuration()
+	if v := dur(c.Sync.ExportLag, 0); v > lag {
+		lag = v
+	}
+	if lag < sender.DefaultExportVisibilityLag {
+		lag = sender.DefaultExportVisibilityLag
+	}
+	return lag
 }
 
 // WatermarkDuration 返回水位延迟。

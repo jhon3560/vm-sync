@@ -31,6 +31,14 @@ type Config struct {
 // seqJumpLimit 允许的最大 seq 跳跃（防外部/异常帧污染 last_seq）。
 const seqJumpLimit uint64 = 100000
 
+// dedupWindowCap 内容去重窗口容量：只对最近处理的 N 帧按 (seq,CRC) 精确去重。
+// seq ≤ last_seq 的帧只有当内容（CRC）与窗口内记录一致时才按重复吞掉——
+// 发送端 WAL 重建（seq 从 1 重新编号）重发的数据内容不同，必须重新落库，
+// 否则整段重导数据被静默吞掉（R15 实测：writes=0）。窗口只保最近 N 个 seq，
+// 覆盖停等 ACK 丢失重发与 go-back-N 重发窗口（≤ 发送端 pipeline 大小）的
+// 常见重复；越界退化为重导（幂等覆盖，代价仅是一次 import）。
+const dedupWindowCap = 4096
+
 // Receiver 帧处理器：Decode → 去重 → 写 Influx → ACK。
 // 依据协议：写库成功后才回 0xff，保证“ACK = 已落库”。
 type Receiver struct {
@@ -52,6 +60,13 @@ type Receiver struct {
 	gapWarned   atomic.Uint64  // 上次 Warn 的缺口首帧 seq（日志节流）
 	gapWarnedAt atomic.Int64   // 上次 Warn 时间（unixnano，时间窗复位用）
 
+	// R15：内容去重窗口（seq -> 已处理帧 CRC）。seq ≤ last_seq 的帧只在该窗口
+	// 内 CRC 命中才吞（真重复）；否则按新帧重导（发送端 WAL 重建/seq 复用场景，
+	// 幂等覆盖保证安全）。按 FIFO 淘汰最旧条目。
+	dedupMu  sync.Mutex
+	dedupSeq []uint64
+	dedupCRC map[uint64]uint32
+
 	persistMu sync.Mutex
 	persistAt time.Time // last_seq 持久化节流（每秒最多一次）
 }
@@ -69,6 +84,7 @@ func New(client *vm.Client, metrics *monitor.Metrics, logger *zap.Logger, cfg Co
 		cfg:         cfg,
 		seqOrd:      newSeqTracker(),
 		inflightSeq: make(map[uint64]int),
+		dedupCRC:    make(map[uint64]uint32, dedupWindowCap),
 	}
 	if cfg.LastSeqFile != "" {
 		seq, err := loadLastSeq(cfg.LastSeqFile)
@@ -98,12 +114,18 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 		return protocol.AckSuccess
 	}
 
-	// 重复检测：已成功处理的连续前缀直接确认
-	// （并发写库下 last_seq 只按连续前缀推进，保证此判定绝不吞掉未完成帧）
+	// 重复检测（R15）：seq ≤ last_seq 的帧只在内容去重窗口 CRC 命中时才吞掉。
+	// 纯 seq 判定会把发送端 WAL 重建（seq 从 1 重新编号）重导的帧全部吞掉，
+	// 造成静默数据丢失（实测 writes=0）；命中窗口的帧是近期已落库的同一内容，
+	// 吞掉安全（At-Least-Once 语义下重复帧由幂等覆盖兜底，去重仅为省写放大）。
 	if f.Seq <= uint64(r.lastSeq.Load()) {
-		r.metrics.IncDup()
-		r.logger.Debug("duplicate seq (<=last_seq)", zap.Uint64("seq", f.Seq))
-		return protocol.AckSuccess
+		if r.dedupHit(f.Seq, f.CRC) {
+			r.metrics.IncDup()
+			r.logger.Debug("duplicate frame (seq+crc in dedup window)", zap.Uint64("seq", f.Seq))
+			return protocol.AckSuccess
+		}
+		r.logger.Info("seq reuse with different content, re-importing (idempotent overwrite)",
+			zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 	}
 
 	// 在途登记（N6 缺口闭合双保险 + recv_inflight 指标）
@@ -193,13 +215,15 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 				zap.Int("http_status", httpStatus), zap.Error(err))
 			// 视为已处理：推进 last_seq，回 0xff 解卡主通道
 			r.markDone(f.Seq)
+			r.dedupRecord(f.Seq, f.CRC) // R15：重发同帧不二次进 DLQ
 			return protocol.AckSuccess
 		}
 		r.logger.Error("influx write failed (transient)", zap.Uint64("seq", f.Seq), zap.Int("lines", nLines), zap.Error(err))
 		return protocol.AckFail // 可重试：不更新 last_seq，不确认；Sender 重发
 	}
 	r.metrics.IncWriteOk()
-	// 写库成功后无额外去重登记：last_seq 连续推进 + 幂等写入已覆盖重复帧；
+	// R15：写库成功后登记内容去重窗口（seq,CRC）——seq ≤ last_seq 的重发帧
+	// 凭此精确判定真重复；内容不同（发送端 WAL 重建）则重导。
 	// 并发同 seq 在途重复（滑窗重发窗口内）双写幂等无害。
 
 	// V1.3 中继：写库成功的同时，原始 Line Protocol 写入转发 WAL（
@@ -229,6 +253,7 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 
 	// 写库成功后才推进 last_seq（顺序铁律）
 	r.markDone(f.Seq)
+	r.dedupRecord(f.Seq, f.CRC)
 	// A5：记录最后落库点时间戳（e2e 延迟指标）
 	if r.cfg.LastWriteTs != nil {
 		if ts := lastPointTimestamp(raw); ts > 0 {
@@ -257,6 +282,31 @@ func (r *Receiver) addInflight(seq uint64) {
 	r.inflightMu.Lock()
 	r.inflightSeq[seq]++
 	r.inflightMu.Unlock()
+}
+
+// dedupRecord 登记已成功处理帧的内容（R15）：写入窗口并 FIFO 淘汰最旧条目。
+// 同 seq 再次登记（重导）时只更新 CRC，不重复入队。
+func (r *Receiver) dedupRecord(seq uint64, crc uint32) {
+	r.dedupMu.Lock()
+	if _, ok := r.dedupCRC[seq]; !ok {
+		r.dedupSeq = append(r.dedupSeq, seq)
+		if len(r.dedupSeq) > dedupWindowCap {
+			delete(r.dedupCRC, r.dedupSeq[0])
+			r.dedupSeq = r.dedupSeq[1:]
+		}
+	}
+	r.dedupCRC[seq] = crc
+	r.dedupMu.Unlock()
+}
+
+// dedupHit 判断 (seq,CRC) 是否命中内容去重窗口（=近期已成功处理的同一帧）。
+// R22：必须显式检查存在性——map 缺失时零值 0 会与 CRC=0 的帧误命中，
+// 把未处理过的帧吞掉（大跳跃越过的区间帧 + CRC32 碰撞到 0 时造成丢数据）。
+func (r *Receiver) dedupHit(seq uint64, crc uint32) bool {
+	r.dedupMu.Lock()
+	defer r.dedupMu.Unlock()
+	c, ok := r.dedupCRC[seq]
+	return ok && c == crc
 }
 
 func (r *Receiver) removeInflight(seq uint64) {
@@ -447,18 +497,37 @@ func (t *seqTracker) load() uint64 {
 	return t.last
 }
 
-// saveLastSeq 原子持久化 last_seq（tmp + rename）。
+// saveLastSeq 原子持久化 last_seq（tmp + fsync + rename + 目录 fsync）。
+// R21：修复前 WriteFile+rename 无 fsync——掉电后 rename 可能丢失，last_seq
+// 回退（重启后重复帧由幂等覆盖兜底不丢数据，但重发风暴放大）；对齐 WAL
+// checkpoint 的持久化纪律。
 func saveLastSeq(path string, seq int64) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("receiver: mkdir: %w", err)
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d\n", seq)), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return fmt.Errorf("receiver: write last_seq: %w", err)
+	}
+	if _, err := f.Write([]byte(fmt.Sprintf("%d\n", seq))); err != nil {
+		f.Close()
+		return fmt.Errorf("receiver: write last_seq: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("receiver: fsync last_seq: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("receiver: close last_seq: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("receiver: rename last_seq: %w", err)
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
 	}
 	return nil
 }

@@ -92,3 +92,18 @@ wal:
 		t.Fatalf("frame_bytes=%d window_target=%d", c.Sync.FrameBytes, c.Sync.WindowTarget)
 	}
 }
+
+// TestValidateBackfill R20：入口级回填值校验（YAML 路径已在 Validate 拦截；
+// 本函数供内嵌 flag 路径复用）——乱值/负值必须拒绝，合法值通过。
+func TestValidateBackfill(t *testing.T) {
+	for _, ok := range []string{"", "all", "0", "0s", "30d", "1d12h"} {
+		if err := ValidateBackfill(ok); err != nil {
+			t.Fatalf("backfill %q must validate: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"30dd", "-30d", "xyz"} {
+		if err := ValidateBackfill(bad); err == nil {
+			t.Fatalf("backfill %q must be rejected", bad)
+		}
+	}
+}

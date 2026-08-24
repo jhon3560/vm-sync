@@ -233,9 +233,11 @@ func (s *Server) handleConn(ctx context.Context, id uint64, conn net.Conn) {
 		if _, err := io.ReadFull(conn, frameBytes[protocol.HeaderSize:]); err != nil {
 			return
 		}
-		// 数据帧序号：读帧循环按序分配（确定性首帧标识，N6）
+		// 数据帧序号：读帧循环按序分配（确定性首帧标识，N6）。R17：zstd 数据帧
+		// （TypeDataZstd，默认压缩）同样计入——修复前仅 TypeData 递增，zstd 帧
+		// 恒为 0，"新连接首帧"语义失效（实验证实 3 帧全为 frameIdx=0）。
 		fIdx := uint64(0)
-		if head.Type == protocol.TypeData {
+		if head.Type == protocol.TypeData || head.Type == protocol.TypeDataZstd {
 			fIdx = dataIdx
 			dataIdx++
 		}

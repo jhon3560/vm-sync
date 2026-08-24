@@ -8,6 +8,7 @@ package sender
 import (
 	"bytes"
 	"context"
+	"errors"
 	"syscall"
 	"time"
 
@@ -23,15 +24,31 @@ import (
 type PollerConfig struct {
 	Interval     time.Duration // 轮询周期，默认 500ms
 	Window       time.Duration // 查询窗口，默认 5s
-	Watermark    time.Duration // 水位延迟，默认 1s（VM 写入即查询可见，仅防时钟抖动）
+	Watermark    time.Duration // 水位延迟，默认 1s（实时延迟地板）
 	MaxWindow    time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
 	FrameLines   int           // 每帧最多 export 行数（每行可含多样本），默认 5000
 	FrameBytes   int           // 每帧压缩前字节上限，默认 512KB
 	WindowTarget int           // N14/R2 窗口增长目标**字节数**（默认=FrameBytes×4）：欠满判定
 	                          // 阈值，按 export 响应字节数判定（行数在高样本率少序列库会误判），
 	                          // 与帧大小解耦——稀疏库窗口不被帧行数锁死
+	// ExportLag 实时区导出可见性安全余量（R24）：窗口尾端距 now < ExportLag 时
+	// 先对源端 POST /internal/force_flush 使 pending rows/新序列立即可见，然后按
+	// watermark 收口（实时 e2e ≈1.5~2.5s）。flush 失败（远端源/未授权/不支持）
+	// 回退到 now-ExportLag 收口——默认 15s，必须覆盖 VM 新序列的最坏可见性延迟
+	// ≈10.5s（存储侧 pending rows 2s deadline+2s 节拍 ≈4s；但新序列名在索引
+	// tag filters 缓存里要等 10s 节拍的 flushCallback 才可见）。有效值 =
+	// max(watermark, exportLag, 15s)，只允许调大。
+	ExportLag time.Duration // 0=自动（≥15s）
 	Compression  uint8         // 数据帧类型（protocol.TypeData=gzip / TypeDataZstd=zstd），默认 zstd
 }
+
+// DefaultExportVisibilityLag 导出可见性安全余量默认值（R24）：flush 失败回退时
+// 窗口尾端与 now 的最小距离。必须覆盖 VM 新序列的最坏可见性延迟：
+// 数据侧 pending rows ≈4s，但新序列名要等索引 flushCallback（10s 节拍 + 抖动）
+// 才可被按名查到（e2e 实测新序列 ~10.5s、存量序列 ~4s 可见）→ 15s 留 ~4s 余量。
+// 调大由用户按负载决定（exportLag flag）；调小无数据安全收益且会重新引入漏发，
+// 故强制地板。
+const DefaultExportVisibilityLag = 15 * time.Second
 
 // 反压三级水位（与 influx-sync 同款）：绿 <60% 全速；黄 60%~80% 降速；红 ≥80% 挂起（迟滞）。
 const (
@@ -51,6 +68,10 @@ const (
 // emptySkipMaxWindow 空窗自适应跳过的窗口上限：真空区 5s→10s→…→1h 翻倍，命中数据即复位。
 const emptySkipMaxWindow = time.Hour
 
+// oversizeMinWindow 单行超限窗口收缩地板：窗口最低缩到 1ms（单行极端大到
+// 1ms 窗口仍无法成帧的病理场景在现实中不可达——单行随窗口变小而变小）。
+const oversizeMinWindow = time.Millisecond
+
 // Poller export 窗口轮询器：拉取 [cursor, now-watermark) 原始样本 → 分块 → WAL → 推进游标。
 type Poller struct {
 	client  *vm.Client
@@ -67,10 +88,19 @@ type Poller struct {
 	underfillStreak int
 	streakAllEmpty  bool
 
+	// oversizeStreak 连续"单行超限"计数（R16）：单条 export 行无法成帧
+	// （单序列样点过多：>MaxFrameLen 压缩后 / >MaxDecompressedLen 原始）时
+	// 窗口逐轮减半（封底 1ms）——修复前 encode 持续失败、游标永不推进，
+	// 同步永久停滞且每 500ms 重复拉取同一大窗。
+	oversizeStreak int
+
 	// prefetch 单窗口轮次的下窗口预取（N16）：处理本轮结果时下一轮 export 在途，
 	// 隐藏源库查询延迟（influx-sync 实测 ~1.8s/轮 → 0.41→0.76 天/分钟）。
 	// 仅 Run 循环 goroutine 访问，无竞态。
 	prefetch *prefetchSlot
+
+	// lastFlushWarn 上次 force_flush 失败告警时间（R24，节流：最多每分钟一条）。
+	lastFlushWarn time.Time
 }
 
 // prefetchSlot 在途预取查询。consume 时若 cursor 与当前游标不符
@@ -96,6 +126,16 @@ func NewPoller(client *vm.Client, w *wal.WAL, metrics *monitor.Metrics, logger *
 	}
 	if cfg.Watermark <= 0 {
 		cfg.Watermark = time.Second
+	}
+	// R24：窗口尾端进入实时区（距 now < ExportLag）时必须先 force_flush 源端
+	// ——VM export 看不到 pending rows（≈4s），新序列名更要等索引 flushCallback
+	// 10s 节拍（≈10.5s）才可查；不 flush 时游标会越过不可见数据造成永久漏发
+	// （e2e 实测修复前实时写入 100% 丢失）。有效余量 = max(watermark, exportLag, 15s)。
+	if cfg.ExportLag < DefaultExportVisibilityLag {
+		cfg.ExportLag = DefaultExportVisibilityLag
+	}
+	if cfg.ExportLag < cfg.Watermark {
+		cfg.ExportLag = cfg.Watermark
 	}
 	if cfg.MaxWindow <= 0 {
 		cfg.MaxWindow = 30 * time.Second
@@ -190,7 +230,19 @@ func WalDiskUsageRatio(dir string) float64 {
 
 // windowSize 欠满窗口翻倍（N14）：真空区（全空 streak）上限 1h，稀疏区封顶
 // MaxWindow——快速越过"回拨边界早于库内最早数据"的真空区与稀疏数据区。
+// R16：单行超限时收缩优先——从基础窗口逐级减半（封底 oversizeMinWindow），
+// 使单序列样点密度高的窗口缩到单行可成帧为止。
 func (p *Poller) windowSize() time.Duration {
+	if p.oversizeStreak > 0 {
+		w := p.cfg.Window
+		for i := 0; i < p.oversizeStreak && w > oversizeMinWindow; i++ {
+			w /= 2
+			if w < oversizeMinWindow {
+				w = oversizeMinWindow
+			}
+		}
+		return w
+	}
 	cap := p.cfg.MaxWindow
 	if p.streakAllEmpty {
 		cap = emptySkipMaxWindow
@@ -205,18 +257,59 @@ func (p *Poller) windowSize() time.Duration {
 	return w
 }
 
-// pollOnce 执行一轮 export 查询 → 分块 → WAL → 推进游标（先 WAL 后游标铁律）。
-func (p *Poller) pollOnce(ctx context.Context) {
-	now := time.Now().UnixMilli()
-	cursor := p.wal.Cursor() // 毫秒
-	window := p.windowSize()
-	end := cursor + window.Milliseconds()
-	if maxEnd := now - p.cfg.Watermark.Milliseconds(); end > maxEnd {
+// windowEnd 计算本轮查询窗口尾端（R24 抽取为纯函数便于单测）：
+// end = min(cursor+window, now-收口余量)。flushOK（实时区 force_flush 成功）时
+// 收口余量 = watermark；否则 = ExportLag（保守回退）。非增长态下另受 MaxWindow
+// 钳制（R6）。
+func (p *Poller) windowEnd(cursor, now int64, flushOK bool) int64 {
+	end := cursor + p.windowSize().Milliseconds()
+	maxEnd := now - p.cfg.Watermark.Milliseconds()
+	if !flushOK {
+		if lagEnd := now - p.cfg.ExportLag.Milliseconds(); lagEnd < maxEnd {
+			maxEnd = lagEnd
+		}
+	}
+	if end > maxEnd {
 		end = maxEnd
 	}
 	if p.underfillStreak == 0 && end-cursor > p.cfg.MaxWindow.Milliseconds() {
 		end = cursor + p.cfg.MaxWindow.Milliseconds()
 	}
+	return end
+}
+
+// flushSource 实时区窗口导出前 force_flush 源 VM（R24）：/internal/force_flush
+// 同步冲刷 pending rows + 索引 + 新序列 tag filters 缓存，使全部已写入数据对
+// export 立即可见。失败（远端源/未授权/不支持）返回 false——调用方回退到
+// ExportLag 保守收口；失败告警节流到每分钟一条。
+func (p *Poller) flushSource(ctx context.Context) bool {
+	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := p.client.ForceFlush(flushCtx)
+	cancel()
+	if err == nil {
+		return true
+	}
+	if time.Since(p.lastFlushWarn) > time.Minute {
+		p.lastFlushWarn = time.Now()
+		p.logger.Warn("source force_flush failed; falling back to conservative export lag",
+			zap.Error(err), zap.Duration("export_lag", p.cfg.ExportLag))
+	}
+	return false
+}
+
+// pollOnce 执行一轮 export 查询 → 分块 → WAL → 推进游标（先 WAL 后游标铁律）。
+func (p *Poller) pollOnce(ctx context.Context) {
+	now := time.Now().UnixMilli()
+	cursor := p.wal.Cursor() // 毫秒
+	rawEnd := cursor + p.windowSize().Milliseconds()
+	// R24：窗口尾端进入实时区（距 now < ExportLag）时先 force_flush 源端——
+	// 修复前窗口按 watermark 收口，游标在数据可见（pending rows ≈4s / 新序列
+	// ≈10.5s）前越过其时间戳，实时写入永久漏发（e2e 实测 100% 丢失）。
+	flushOK := true
+	if rawEnd > now-p.cfg.ExportLag.Milliseconds() {
+		flushOK = p.flushSource(ctx)
+	}
+	end := p.windowEnd(cursor, now, flushOK)
 	if end <= cursor {
 		return // 无新窗口
 	}
@@ -254,6 +347,7 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		// 避免大窗口持续失败导致停滞（如响应超限/源库抖动）。
 		p.underfillStreak = 0
 		p.streakAllEmpty = true
+		p.oversizeStreak = 0 // R16：窗口收缩随失败一并复位
 		return // 保持游标，下轮重试
 	}
 
@@ -283,6 +377,7 @@ func (p *Poller) pollOnce(ctx context.Context) {
 			p.prefetch = nil // 游标未推进，预取结果作废（consume 时兜底再查）
 			return
 		}
+		p.oversizeStreak = 0 // R16：成功轮复位收缩
 		p.metrics.SetCursor(end)
 		return
 	}
@@ -295,7 +390,16 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	for _, f := range frames {
 		fb, err := protocol.Encode(p.cfg.Compression, 0, f)
 		if err != nil {
-			p.logger.Error("frame encode failed, keep cursor", zap.Error(err))
+			if errors.Is(err, protocol.ErrTooLarge) {
+				// R16：单行超限成帧失败（单序列样点过密）。收缩窗口下一轮重试，
+				// 游标保持——修复前此错误会永久停滞同步主链路。
+				p.oversizeStreak++
+				p.logger.Warn("frame too large (single line), shrinking window next round",
+					zap.Error(err), zap.Int("oversize_streak", p.oversizeStreak),
+					zap.Duration("next_window", p.windowSize()))
+			} else {
+				p.logger.Error("frame encode failed, keep cursor", zap.Error(err))
+			}
 			p.prefetch = nil
 			return
 		}
@@ -312,6 +416,7 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		p.prefetch = nil
 		return
 	}
+	p.oversizeStreak = 0 // R16：成功轮复位收缩
 	p.metrics.SetCursor(end)
 	p.metrics.SetWALPending(int64(p.wal.PendingCount()))
 	p.metrics.SetWALBytes(p.wal.DiskUsage())
@@ -333,6 +438,11 @@ func (p *Poller) launchPrefetch(ctx context.Context, cursor int64) {
 	ne := cursor + nw.Milliseconds()
 	if maxEnd := time.Now().UnixMilli() - p.cfg.Watermark.Milliseconds(); ne > maxEnd {
 		ne = maxEnd
+	}
+	// R24：实时区不预取——预取查询在 force_flush 前发出，可能拿到不可见空结果
+	// 且无法补救；实时区改为 flush + 同步 export（窗口小，预取收益本就低）。
+	if time.Now().UnixMilli()-ne < p.cfg.ExportLag.Milliseconds() {
+		return
 	}
 	if ne <= cursor {
 		return // 已追平水位，无窗口可预取

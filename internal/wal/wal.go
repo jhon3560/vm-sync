@@ -544,7 +544,9 @@ func (w *WAL) PeekBatch(n int) ([]FrameData, error) {
 		fi := w.index[w.acked+i]
 		buf := make([]byte, fi.length)
 		readOff := fi.offset + recordHeadLen // 跳过 [u32 len] 记录头
-		if fi.seg == w.curSeg {
+		// R18：curFile 可能为 nil（Close 后仍被使用 / 段删除后未重建）——
+		// 回退到按路径打开，而非 nil 指针 ErrInvalid。
+		if fi.seg == w.curSeg && w.curFile != nil {
 			if _, err := w.curFile.ReadAt(buf, readOff); err != nil {
 				return nil, fmt.Errorf("wal: read frame %d: %w", fi.seq, err)
 			}
@@ -596,8 +598,10 @@ func (w *WAL) commitLocked(seq uint64) error {
 		segRemoved = true
 		// 删除的恰是当前写入段时，滚动到新段序号（文件延迟到下次 Append 创建）
 		if removed == w.curSeg {
-			if err := w.curFile.Close(); err != nil {
-				return fmt.Errorf("wal: close rotated segment: %w", err)
+			if w.curFile != nil { // R18：Close 后 curFile 已为 nil，跳过避免 ErrInvalid
+				if err := w.curFile.Close(); err != nil {
+					return fmt.Errorf("wal: close rotated segment: %w", err)
+				}
 			}
 			w.curFile = nil
 			w.curSeg++

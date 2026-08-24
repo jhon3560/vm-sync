@@ -53,7 +53,7 @@ func Encode(typ uint8, seq uint64, payload []byte) ([]byte, error) {
 	}
 	// 压缩前先校验原始大小（V1.2.2）：防止 payload 超过解压上限被截断
 	if len(payload) > MaxDecompressedLen {
-		return nil, fmt.Errorf("protocol: payload too large: %d bytes (max %d), reduce batch_points", len(payload), MaxDecompressedLen)
+		return nil, fmt.Errorf("%w: payload too large: %d bytes (max %d), reduce batch_points", ErrTooLarge, len(payload), MaxDecompressedLen)
 	}
 	var compressed []byte
 	var err error
@@ -69,7 +69,7 @@ func Encode(typ uint8, seq uint64, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	if HeaderSize+len(compressed) > MaxFrameLen {
-		return nil, fmt.Errorf("protocol: frame too large: %d bytes", HeaderSize+len(compressed))
+		return nil, fmt.Errorf("%w: frame too large: %d bytes", ErrTooLarge, HeaderSize+len(compressed))
 	}
 	return encodeRaw(typ, seq, compressed, crc32.ChecksumIEEE(compressed)), nil
 }

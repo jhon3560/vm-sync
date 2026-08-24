@@ -223,6 +223,32 @@ func (c *Client) ImportWrite(ctx context.Context, raw []byte) error {
 	return nil
 }
 
+// ForceFlush POST /internal/force_flush 到源 VM（R24）：同步冲刷 pending rows
+// + 索引 + 新序列 tag filters 缓存，使全部已写入数据（含新序列名）对 export
+// 立即可见。任何失败（非 200/网络错误/未授权/远端无此端点）返回 error——
+// 调用方必须回退到保守导出余量（ExportLag），绝不把 flush 失败当成功推进游标。
+func (c *Client) ForceFlush(ctx context.Context) error {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	u := fmt.Sprintf("%s/internal/force_flush", c.cfg.URL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return fmt.Errorf("vm: build force_flush: %w", err)
+	}
+	c.setAuth(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("vm: force_flush: %w", err)
+	}
+	// 限读并丢弃响应体（复用连接）；本端点成功时为 200 空体
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("vm: force_flush http %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // LastSampleTimestamp 返回 JSON lines 中最后一个样本的时间戳（毫秒，A5 e2e 延迟指标用）。
 // 每行形如 {"metric":{...},"values":[...],"timestamps":[t1,t2,...]}——取全部行的最大尾时间戳。
 func LastSampleTimestamp(raw []byte) int64 {

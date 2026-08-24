@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,6 +169,60 @@ func TestHeartbeatRoundTrip(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("heartbeat not received")
+	}
+}
+
+// TestFrameIdxCountsZstdDataFrames R17 回归：frameIdx（连接内数据帧到达序号）
+// 必须对 zstd 数据帧（TypeDataZstd，默认压缩）递增——修复前仅 TypeData 递增，
+// zstd 帧恒为 frameIdx=0（实测 3 帧全 0），"新连接首帧=发送端 WAL 头"语义失效。
+func TestFrameIdxCountsZstdDataFrames(t *testing.T) {
+	var mu sync.Mutex
+	var seen []uint64
+	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, fidx uint64, fb []byte) byte {
+		if _, err := protocol.Decode(fb); err != nil {
+			return protocol.AckFail
+		}
+		mu.Lock()
+		seen = append(seen, fidx)
+		mu.Unlock()
+		return protocol.AckSuccess
+	})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go srv.Serve(ctx)
+	t.Cleanup(func() { cancel(); srv.Close() })
+
+	c := NewClient(ClientConfig{Addr: srv.Addr().String(), Timeout: 3 * time.Second})
+	defer c.Close()
+	if err := c.EnsureConnected(); err != nil {
+		t.Fatal(err)
+	}
+	for seq := uint64(1); seq <= 3; seq++ {
+		fb, _ := protocol.EncodeDataZstd(seq, []byte(`{"metric":{"__name__":"m"},"values":[1],"timestamps":[1]}`+"\n"))
+		if err := c.SendFrame(fb); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.WaitAck(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 等 handler 全部执行完
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n >= 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 3 || seen[0] != 0 || seen[1] != 1 || seen[2] != 2 {
+		t.Fatalf("frameIdx sequence for 3 zstd data frames: %v, want [0 1 2]", seen)
 	}
 }
 

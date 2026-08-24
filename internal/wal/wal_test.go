@@ -486,6 +486,40 @@ func TestTornHeadRecovery(t *testing.T) {
 
 // TestCheckpointThrottled P3：Commit 路径的 checkpoint 持久化节流到每秒一次，
 // 段删除/SetCursor/Close 立即持久化。
+// TestReadCommitAfterClose R18 回归：WAL Close 后仍有在途 goroutine 使用（
+// Stop 等待前的竞态窗口 / 独立版进程退出收尾）时，Peek/Commit 必须干净工作
+// 而非 nil curFile → ErrInvalid 错误风暴。Peek 回退按路径打开；Commit 删除
+// 当前写入段时跳过已关闭的文件句柄。
+func TestReadCommitAfterClose(t *testing.T) {
+	w := newTestWAL(t, 0)
+	if _, err := w.Append(protocol.TypeData, []byte("m value=1 1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Peek：应正常读到未确认帧（按路径打开，不再依赖已关闭的 curFile）
+	seq, fb, err := w.Peek()
+	if err != nil {
+		t.Fatalf("peek after close: %v", err)
+	}
+	if seq != 1 || len(fb) == 0 {
+		t.Fatalf("peek seq=%d len=%d", seq, len(fb))
+	}
+	// Commit：删除的恰是当前写入段（curFile 已 nil）——不得报错/panic，
+	// 状态推进与正常路径一致
+	if err := w.Commit(seq); err != nil {
+		t.Fatalf("commit after close: %v", err)
+	}
+	if w.PendingCount() != 0 {
+		t.Fatalf("pending=%d after commit", w.PendingCount())
+	}
+	// Close 幂等：二次 Close 不报错
+	if err := w.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+}
+
 func TestCheckpointThrottled(t *testing.T) {
 	w := newTestWAL(t, 0)
 	seqs := make([]uint64, 0, 5)
