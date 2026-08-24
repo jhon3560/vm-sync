@@ -50,11 +50,13 @@ VictoriaMetrics 的 `/api/v1/export`（查询）与 `/api/v1/import`（写入）
 |---|---|
 | 顺序铁律 | 先 WAL 落盘成功、后推进游标——违反会漏数据 |
 | 帧序 | seq 连续（WAL 内部分配），停等逐帧确认；0xff=已落库才 Commit |
-| 去重 | receiver last_seq 连续前缀 + 发送方权威缺口闭合（重启后恢复连续推进） |
-| 断点续传 | WAL 游标 + checkpoint（1s 节流）+ 重启扫描重建；last_seq 每秒持久化 |
+| 去重 | receiver last_seq 连续前缀 + **内容去重窗口（V0.3/R15）**：最近 4096 帧记 (seq,CRC)，仅同 seq 且同 CRC 才吞——发送端 WAL 重建重导/大跳跃越过区间帧不再被静默丢弃（同 series+ts 覆盖写幂等兑底） |
+| 断点续传 | WAL 游标 + checkpoint（1s 节流）+ 重启扫描重建；last_seq 每秒持久化（fsync，V0.3/R21） |
 | 毒丸 | import 4xx → DLQ 落盘隔离 + 0xff 解卡（主链路不阻塞）；瞬时失败 0x00 重试，永不丢弃 |
 | 反压 | WAL 盘占用三级水位（60%/80% 迟滞） |
-| WAL 健壮性 | 撕裂尾截断恢复、中段坏帧跳帧重同步、flock 防多实例 |
+| WAL 健壮性 | 撕裂尾截断恢复、中段坏帧跳帧重同步、flock 防多实例；关闭后 Peek/Commit 安全退化（V0.3/R18） |
+| 单行超限 | 单序列样点密度过高致整帧超限时，窗口逐轮减半（oversizeStreak）自动收缩（V0.3/R16）——同步不永久停滞 |
+| 优雅退出 | Stop 先 cancel 并等 poller/sender 退出，再关连接/WAL（V0.3/R18） |
 
 ## 4. 历史回填（backfill，与 influx-sync V1.7 同语义）
 
@@ -64,18 +66,26 @@ VictoriaMetrics 的 `/api/v1/export`（查询）与 `/api/v1/import`（写入）
   存量部署升级只记录不回拨（防升级即全库重发）；
 - "库只有 10 天数据、配 30d/all"→ 从 10 天前开始搬；真空区/稀疏区由欠满窗口翻倍跳过兜底（V0.2/N14：空窗或字节数 < window_target 均翻倍；真空区上限 1h、稀疏区封顶 max_window）
   （5s→…→1h，命中数据复位）。
+- **V0.3/R19+R23 语义**：探测失败（源暂不可达）或库为空时，本次启动**不记录策略**
+  （只从水位起同步实时），下次重启探测成功后再回拨——修复前失败/空库都会把策略
+  锁死（policy=-1/boundary=0 落盘），后续导入的历史数据永久漏发。
 
-## 5. 实时性模型（与 influx-sync 的关键差异）
+## 5. 实时性模型与导出可见性（V0.3/R24 修正）
 
-VictoriaMetrics 单机版**没有** SUBSCRIPTION 式"写后推送"，V0.1 无快路径：
+VictoriaMetrics 单机版**没有** SUBSCRIPTION 式"写后推送"，且 `/api/v1/export` 对
+**pending rows 不可见**（真机实测：旧序列约 3.3~3.9s 可见；新序列名要等索引
+flushCallback 10s 节拍，最坏约 10.5s 才可被按名查到）。若照"写入即查询可见"
+推进游标，会越过不可见数据造成**永久漏发**。V0.3 起：
 
-- 实时性靠低水位轮询：`interval: 500ms` + `watermark: 1s`（默认）→ e2e ≈ 1.5~2.5s；
-- VM 写入即查询可见（无 Influx 的可见性顾虑），watermark 仅防时钟抖动，可配到更低；
+- 窗口尾端进入实时区（距 now < 导出可见性余量，默认 max(watermark, 15s)）时，
+  先对源端 `POST /internal/force_flush` 使 pending rows/新序列立即可见，再按
+  watermark 收口 → e2e ≈ 1.5~2.5s（interval 500ms + watermark 1s）；
+- flush 失败（远端源/未授权）才回退到保守余量收口（只允许调大 `export_lag`）；
 - export 查询走索引、无聚合开销，500ms 轮询成本可忽略。
 
 **快路径（V2 计划）**：VM 生态的标准"订阅"替代是 **vmagent 多目标 remoteWrite 双写**
 （写入方 → vmagent → [源 VM, vm-sync 快路径端点]），sender 实现 remote_write 接收端
-（snappy protobuf 解码 → JSON lines → 帧），复用 influx-sync 去重集，e2e 可达 0~1s。
+（snappy protobuf 解码 → JSON lines → 帧），复用去重集，e2e 可达 0~1s。
 
 ## 6. 关键设计约束
 

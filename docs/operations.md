@@ -6,6 +6,7 @@
 |---|---|
 | `poll window start=… end=… frames=N` | 每轮 export 查询与分块 |
 | `export failed, keep cursor` | 源查询失败（保持游标，下轮重试；V0.2 起失败同时复位窗口增长，下轮回基础窗口自愈） |
+| `source force_flush failed; falling back to conservative export lag`（Warn，最多 1 条/分钟） | 实时区强制可见性 flush 失败（远端源/未授权）→ 回退到 export_lag 保守余量收口，实时延迟变大但数据不漏 |
 | `prefetch discarded (cursor mismatch), re-export`（Debug） | N16 预取槽与当前游标不符（上一轮失败未推进）→ 丢弃同步重查，正常防御路径非错误 |
 | `ack success seq=N` / `retry frame seq=N` | 发送进度/重试 |
 | `frame written seq=N` | 落库成功 |

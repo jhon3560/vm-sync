@@ -20,6 +20,10 @@ sync:
   window_target: 2MB    # V0.2 窗口增长目标字节数（默认=frame_bytes×4）：欠满判定阈值，
                         # 按 export 响应字节数判定（行数在高样本率少序列库会误判稀疏→窗口震荡），
                         # 与帧大小解耦——稀疏库窗口仍按大数据量目标增长，不被帧行数锁死
+  export_lag: 15s     # V0.3 实时区导出可见性安全余量（0=自动≥15s）：窗口尾端距 now < 此值时
+                      # 先对源端 POST /internal/force_flush 使 pending rows/新序列立即可见，
+                      # flush 失败才回退此余量收口；只允许调大（VM pending rows ≈4s、新序列名
+                      # 需等索引 10s 节拍 ≈10.5s 才可见）
   backfill: all      # 回填：all=全量(默认) / 0=仅实时 / 30d=有界（d 单位，1d=24h）
 
 wal:
