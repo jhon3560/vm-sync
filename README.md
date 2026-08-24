@@ -97,7 +97,9 @@ tcp:
 ```
 
 完整参数见 [docs/configuration.md](docs/configuration.md)，部署见
-[docs/deployment.md](docs/deployment.md)，运维排障见 [docs/operations.md](docs/operations.md)。
+[docs/deployment.md](docs/deployment.md)，运维排障见 [docs/operations.md](docs/operations.md)，
+性能数据见 [docs/performance.md](docs/performance.md)，下一步开发方向见
+[docs/roadmap.md](docs/roadmap.md)。
 
 ## 目录
 
@@ -113,7 +115,7 @@ internal/receiver 帧处理（内容去重/DLQ/import 写库）
 internal/monitor  Prometheus 指标（vm_sync_*）
 internal/config   配置加载（d 单位、KB/MB 单位、backfill 三模式）
 bench/linkproxy   字节计数代理（带宽测试）
-docs/             架构/配置/部署/运维/性能/规划/审计记录
+docs/             架构/配置/部署/运维/性能/路线图/规划/审计记录
 ```
 
 ## 相关项目
